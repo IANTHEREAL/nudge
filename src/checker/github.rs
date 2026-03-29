@@ -1,0 +1,225 @@
+use anyhow::Result;
+use crate::subscription::Subscription;
+
+/// Check a GitHub subscription condition by calling `gh` CLI.
+pub async fn check(sub: &Subscription) -> Result<Option<serde_json::Value>> {
+    let kind = sub.condition.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let number = sub.condition.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+    let event = sub.condition.get("event").and_then(|v| v.as_str()).unwrap_or("");
+    let repo = sub.condition.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+
+    match (kind, event) {
+        ("pr", "merged") => check_pr_merged(repo, number).await,
+        ("pr", "closed") => check_pr_closed(repo, number).await,
+        ("pr", e) if e.starts_with("label:") => {
+            let label = &e["label:".len()..];
+            check_pr_label(repo, number, label).await
+        }
+        ("pr", "new-comment") => check_new_comment(repo, number, sub).await,
+        ("pr", "ci-passed") | ("ci", "success") => check_ci(repo, number, "success").await,
+        ("ci", "failure") => check_ci(repo, number, "failure").await,
+        ("ci", "completed") => check_ci(repo, number, "completed").await,
+        ("issue", "new-comment") => check_new_comment(repo, number, sub).await,
+        ("issue", "closed") => check_issue_closed(repo, number).await,
+        ("issue", e) if e.starts_with("label:") => {
+            let label = &e["label:".len()..];
+            check_issue_label(repo, number, label).await
+        }
+        _ => {
+            tracing::warn!(kind, event, "Unknown github condition");
+            Ok(None)
+        }
+    }
+}
+
+async fn gh_api(endpoint: &str, jq: &str) -> Result<String> {
+    let output = tokio::process::Command::new("gh")
+        .args(["api", endpoint, "--jq", jq])
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh api failed: {stderr}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn check_pr_merged(repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
+    let merged = gh_api(
+        &format!("repos/{repo}/pulls/{number}"),
+        ".merged",
+    ).await?;
+    if merged == "true" {
+        Ok(Some(serde_json::json!({
+            "source": "github", "type": "pr_merged",
+            "repo": repo, "pr": number,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn check_pr_closed(repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
+    let state = gh_api(
+        &format!("repos/{repo}/pulls/{number}"),
+        ".state",
+    ).await?;
+    if state == "closed" {
+        Ok(Some(serde_json::json!({
+            "source": "github", "type": "pr_closed",
+            "repo": repo, "pr": number,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn check_pr_label(repo: &str, number: i64, label: &str) -> Result<Option<serde_json::Value>> {
+    let labels = gh_api(
+        &format!("repos/{repo}/pulls/{number}"),
+        "[.labels[].name] | join(\",\")",
+    ).await?;
+    if labels.split(',').any(|l| l.trim() == label) {
+        Ok(Some(serde_json::json!({
+            "source": "github", "type": "label_added",
+            "repo": repo, "pr": number, "label": label,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn check_issue_closed(repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
+    let state = gh_api(
+        &format!("repos/{repo}/issues/{number}"),
+        ".state",
+    ).await?;
+    if state == "closed" {
+        Ok(Some(serde_json::json!({
+            "source": "github", "type": "issue_closed",
+            "repo": repo, "issue": number,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn check_issue_label(repo: &str, number: i64, label: &str) -> Result<Option<serde_json::Value>> {
+    let labels = gh_api(
+        &format!("repos/{repo}/issues/{number}"),
+        "[.labels[].name] | join(\",\")",
+    ).await?;
+    if labels.split(',').any(|l| l.trim() == label) {
+        Ok(Some(serde_json::json!({
+            "source": "github", "type": "label_added",
+            "repo": repo, "issue": number, "label": label,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn check_new_comment(repo: &str, number: i64, sub: &Subscription) -> Result<Option<serde_json::Value>> {
+    let count_str = gh_api(
+        &format!("repos/{repo}/issues/{number}/comments?per_page=1"),
+        "length",
+    ).await?;
+    // Use total count from headers — but gh api doesn't expose that easily.
+    // Instead, get the comment count from the issue itself.
+    let count_str = gh_api(
+        &format!("repos/{repo}/issues/{number}"),
+        ".comments",
+    ).await?;
+    let current_count: i64 = count_str.parse().unwrap_or(0);
+
+    // The baseline count is stored in the condition at subscription time.
+    let baseline = sub.condition.get("comment_count_at_subscribe")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(current_count); // If no baseline, treat current as baseline (no new comment yet)
+
+    if current_count > baseline {
+        Ok(Some(serde_json::json!({
+            "source": "github", "type": "new_comment",
+            "repo": repo, "number": number,
+            "new_count": current_count, "baseline": baseline,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn check_ci(repo: &str, number: i64, expected: &str) -> Result<Option<serde_json::Value>> {
+    // Get check runs for the PR's head SHA
+    let sha = gh_api(
+        &format!("repos/{repo}/pulls/{number}"),
+        ".head.sha",
+    ).await?;
+
+    if sha.is_empty() {
+        // Maybe it's a run number, not a PR
+        let status = gh_api(
+            &format!("repos/{repo}/actions/runs/{number}"),
+            "{status: .status, conclusion: .conclusion}",
+        ).await?;
+        let parsed: serde_json::Value = serde_json::from_str(&status).unwrap_or_default();
+        let conclusion = parsed.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+        let run_status = parsed.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
+        let fired = match expected {
+            "success" => conclusion == "success",
+            "failure" => conclusion == "failure",
+            "completed" => run_status == "completed",
+            _ => false,
+        };
+
+        if fired {
+            return Ok(Some(serde_json::json!({
+                "source": "github", "type": "ci_result",
+                "repo": repo, "run": number, "conclusion": conclusion,
+            })));
+        }
+        return Ok(None);
+    }
+
+    // PR-based CI check
+    let check_status = gh_api(
+        &format!("repos/{repo}/commits/{sha}/check-runs"),
+        "[.check_runs[] | {name: .name, status: .status, conclusion: .conclusion}]",
+    ).await?;
+
+    let checks: Vec<serde_json::Value> = serde_json::from_str(&check_status).unwrap_or_default();
+
+    if checks.is_empty() {
+        return Ok(None);
+    }
+
+    let all_completed = checks.iter().all(|c| c["status"] == "completed");
+    if !all_completed {
+        return Ok(None);
+    }
+
+    let overall = if checks.iter().all(|c| c["conclusion"] == "success") {
+        "success"
+    } else if checks.iter().any(|c| c["conclusion"] == "failure") {
+        "failure"
+    } else {
+        "completed"
+    };
+
+    let fired = match expected {
+        "success" => overall == "success",
+        "failure" => overall == "failure",
+        "completed" => true,
+        _ => false,
+    };
+
+    if fired {
+        Ok(Some(serde_json::json!({
+            "source": "github", "type": "ci_result",
+            "repo": repo, "pr": number, "conclusion": overall,
+            "checks": checks,
+        })))
+    } else {
+        Ok(None)
+    }
+}
