@@ -13,7 +13,9 @@ pub async fn check(sub: &Subscription) -> Result<Option<serde_json::Value>> {
         ("pr", "closed") => check_pr_closed(repo, number).await,
         ("pr", e) if e.starts_with("label:") => {
             let label = &e["label:".len()..];
-            check_pr_label(repo, number, label).await
+            let was_present = sub.condition.get("label_present_at_subscribe")
+                .and_then(|v| v.as_bool()).unwrap_or(false);
+            check_label(repo, number, label, "pr", was_present).await
         }
         ("pr", "new-comment") => check_new_comment(repo, number, sub).await,
         ("pr", "ci-passed") | ("ci", "success") => check_ci(repo, number, "success").await,
@@ -23,7 +25,9 @@ pub async fn check(sub: &Subscription) -> Result<Option<serde_json::Value>> {
         ("issue", "closed") => check_issue_closed(repo, number).await,
         ("issue", e) if e.starts_with("label:") => {
             let label = &e["label:".len()..];
-            check_issue_label(repo, number, label).await
+            let was_present = sub.condition.get("label_present_at_subscribe")
+                .and_then(|v| v.as_bool()).unwrap_or(false);
+            check_label(repo, number, label, "issue", was_present).await
         }
         _ => {
             tracing::warn!(kind, event, "Unknown github condition");
@@ -74,16 +78,22 @@ async fn check_pr_closed(repo: &str, number: i64) -> Result<Option<serde_json::V
     }
 }
 
-async fn check_pr_label(repo: &str, number: i64, label: &str) -> Result<Option<serde_json::Value>> {
-    let labels = gh_api(
-        &format!("repos/{repo}/pulls/{number}"),
-        "[.labels[].name] | join(\",\")",
-    ).await?;
-    if labels.split(',').any(|l| l.trim() == label) {
-        Ok(Some(serde_json::json!({
+async fn check_label(repo: &str, number: i64, label: &str, kind: &str, was_present: bool) -> Result<Option<serde_json::Value>> {
+    let endpoint = match kind {
+        "pr" => format!("repos/{repo}/pulls/{number}"),
+        _ => format!("repos/{repo}/issues/{number}"),
+    };
+    let labels = gh_api(&endpoint, "[.labels[].name] | join(\",\")").await?;
+    let is_present = labels.split(',').any(|l| l.trim() == label);
+
+    // Only fire if label was NOT present at subscribe time and IS present now
+    if is_present && !was_present {
+        let mut event = serde_json::json!({
             "source": "github", "type": "label_added",
-            "repo": repo, "pr": number, "label": label,
-        })))
+            "repo": repo, "label": label,
+        });
+        event[kind] = serde_json::json!(number);
+        Ok(Some(event))
     } else {
         Ok(None)
     }
@@ -104,21 +114,10 @@ async fn check_issue_closed(repo: &str, number: i64) -> Result<Option<serde_json
     }
 }
 
-async fn check_issue_label(repo: &str, number: i64, label: &str) -> Result<Option<serde_json::Value>> {
-    let labels = gh_api(
-        &format!("repos/{repo}/issues/{number}"),
-        "[.labels[].name] | join(\",\")",
-    ).await?;
-    if labels.split(',').any(|l| l.trim() == label) {
-        Ok(Some(serde_json::json!({
-            "source": "github", "type": "label_added",
-            "repo": repo, "issue": number, "label": label,
-        })))
-    } else {
-        Ok(None)
-    }
-}
-
+/// Check for new comments on an issue or PR.
+/// Note: for PRs, this only counts issue-style comments (from the "Conversation" tab),
+/// NOT PR review comments or inline code review comments. Those are a separate GitHub
+/// concept tracked via /pulls/{number}/reviews and /pulls/{number}/comments endpoints.
 async fn check_new_comment(repo: &str, number: i64, sub: &Subscription) -> Result<Option<serde_json::Value>> {
     let count_str = gh_api(
         &format!("repos/{repo}/issues/{number}"),

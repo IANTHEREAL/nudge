@@ -123,6 +123,12 @@ fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<
                 condition["comment_count_at_subscribe"] = serde_json::json!(count);
             }
 
+            // For label events, snapshot whether label is already present
+            if let Some(label) = event.strip_prefix("label:") {
+                let present = check_label_present(repo, kind, number, label)?;
+                condition["label_present_at_subscribe"] = serde_json::json!(present);
+            }
+
             Ok(condition)
         }
         "webhook" => {
@@ -154,6 +160,21 @@ fn validate_github_kind_event(kind: &str, event: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn check_label_present(repo: &str, kind: &str, number: i64, label: &str) -> Result<bool> {
+    let endpoint = match kind {
+        "pr" => format!("repos/{repo}/pulls/{number}"),
+        _ => format!("repos/{repo}/issues/{number}"),
+    };
+    let output = std::process::Command::new("gh")
+        .args(["api", &endpoint, "--jq", "[.labels[].name] | join(\",\")"])
+        .output()?;
+    if !output.status.success() {
+        bail!("failed to check labels");
+    }
+    let labels = String::from_utf8_lossy(&output.stdout);
+    Ok(labels.split(',').any(|l| l.trim() == label))
 }
 
 fn get_comment_count(repo: &str, number: i64) -> Result<i64> {

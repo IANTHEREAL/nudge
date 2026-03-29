@@ -114,11 +114,21 @@ impl Store {
 
     pub fn set_status(&self, id: &str, status: &str) -> Result<()> {
         let rows = self.conn.execute(
-            "UPDATE subscriptions SET status = ?1 WHERE id = ?2",
+            "UPDATE subscriptions SET status = ?1 WHERE id = ?2 AND status = 'active'",
             params![status, id],
         )?;
         if rows == 0 {
-            bail!("subscription {id} not found");
+            // Distinguish "not found" from "not active"
+            let exists: bool = self.conn.query_row(
+                "SELECT COUNT(*) > 0 FROM subscriptions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                bail!("subscription {id} is not active");
+            } else {
+                bail!("subscription {id} not found");
+            }
         }
         Ok(())
     }
@@ -232,6 +242,37 @@ mod tests {
         let got = store.get("test-2").unwrap().unwrap();
         assert_eq!(got.status, "fired");
         assert_eq!(got.event_data.unwrap()["result"], "done");
+    }
+
+    #[test]
+    fn test_cancel_only_active() {
+        let store = Store::open(":memory:").unwrap();
+        let sub = Subscription {
+            id: "test-cancel".into(),
+            source: "timer".into(),
+            condition: serde_json::json!({}),
+            mode: "wait".into(),
+            callback: None,
+            status: "active".into(),
+            created_at: 1000,
+            expires_at: None,
+            event_data: None,
+        };
+        store.insert(&sub).unwrap();
+
+        // Firing it first should work via set_fired
+        store.set_fired("test-cancel", &serde_json::json!({"done": true})).unwrap();
+
+        // Now cancel should fail because it's no longer active
+        let err = store.set_status("test-cancel", "cancelled").unwrap_err();
+        assert!(err.to_string().contains("not active"), "expected 'not active' error, got: {err}");
+    }
+
+    #[test]
+    fn test_cancel_not_found() {
+        let store = Store::open(":memory:").unwrap();
+        let err = store.set_status("nonexistent", "cancelled").unwrap_err();
+        assert!(err.to_string().contains("not found"), "expected 'not found' error, got: {err}");
     }
 
     #[test]
