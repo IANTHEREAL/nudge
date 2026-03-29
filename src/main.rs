@@ -31,12 +31,13 @@ async fn main() -> Result<()> {
 
 async fn cmd_wait(args: cli::WaitArgs) -> Result<()> {
     let sub = subscription::Subscription::from_wait_args(&args)?;
+
+    // Ensure daemon is running BEFORE inserting — avoids orphan subscriptions if daemon fails
+    daemon::ensure_running()?;
+
     let db = store::Store::open_default()?;
     let id = db.insert(&sub)?;
     tracing::info!(id = %id, source = %sub.source, "Watching...");
-
-    // Ensure daemon is running
-    daemon::ensure_running()?;
 
     // Block until fired or timeout
     let event = daemon::wait_for(&id).await?;
@@ -46,12 +47,13 @@ async fn cmd_wait(args: cli::WaitArgs) -> Result<()> {
 
 async fn cmd_on(args: cli::OnArgs) -> Result<()> {
     let sub = subscription::Subscription::from_on_args(&args)?;
+
+    // Ensure daemon is running BEFORE inserting — avoids orphan subscriptions if daemon fails
+    daemon::ensure_running()?;
+
     let db = store::Store::open_default()?;
     let id = db.insert(&sub)?;
     tracing::info!(id = %id, source = %sub.source, callback = %sub.callback.as_deref().unwrap_or(""), "Registered");
-
-    // Ensure daemon is running
-    daemon::ensure_running()?;
 
     println!("{id}");
     Ok(())

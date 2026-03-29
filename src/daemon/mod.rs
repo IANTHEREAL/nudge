@@ -58,6 +58,7 @@ pub fn ensure_running() -> Result<()> {
 }
 
 /// Wait for a subscription to be fired. Polls the store.
+/// Also checks for local expiry and daemon liveness to avoid blocking indefinitely.
 pub async fn wait_for(id: &str) -> Result<serde_json::Value> {
     loop {
         let db = Store::open_default()?;
@@ -72,12 +73,26 @@ pub async fn wait_for(id: &str) -> Result<serde_json::Value> {
                 "cancelled" => {
                     anyhow::bail!("Subscription cancelled");
                 }
-                _ => {} // still active, keep waiting
+                _ => {
+                    // Check if subscription has passed its expires_at locally
+                    // (daemon may not have run expire_overdue yet, or may be dead)
+                    if let Some(exp) = sub.expires_at {
+                        if chrono::Utc::now().timestamp() >= exp {
+                            anyhow::bail!("Subscription expired (timeout reached)");
+                        }
+                    }
+                }
             }
         } else {
             anyhow::bail!("Subscription {id} not found");
         }
         drop(db);
+
+        // Check if daemon is still alive — if not, no one is processing subscriptions
+        if !is_running() {
+            anyhow::bail!("Daemon is not running — subscription will not be processed");
+        }
+
         sleep(Duration::from_secs(1)).await;
     }
 }
@@ -138,6 +153,12 @@ fn source_interval(source: &str) -> Duration {
 async fn poll_cycle<C: GitHubClient>(last_check: &mut HashMap<String, Instant>, client: &C) -> Result<()> {
     let db = Store::open_default()?;
 
+    // Expire overdue subscriptions FIRST so they aren't checked/fired below
+    let expired = db.expire_overdue()?;
+    if expired > 0 {
+        tracing::info!(count = expired, "Expired overdue subscriptions");
+    }
+
     let now = Instant::now();
 
     let active = db.list_active()?;
@@ -183,11 +204,6 @@ async fn poll_cycle<C: GitHubClient>(last_check: &mut HashMap<String, Instant>, 
                 tracing::warn!(id = %sub.id, error = %e, "Check failed");
             }
         }
-    }
-
-    let expired = db.expire_overdue()?;
-    if expired > 0 {
-        tracing::info!(count = expired, "Expired overdue subscriptions");
     }
 
     Ok(())

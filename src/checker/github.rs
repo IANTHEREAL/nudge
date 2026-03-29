@@ -1,5 +1,8 @@
 use anyhow::Result;
+use tokio::time::{timeout, Duration};
 use crate::subscription::GitHubCondition;
+
+const GH_API_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Trait for GitHub API access — enables testing with mock responses.
 #[async_trait::async_trait]
@@ -13,10 +16,15 @@ pub struct GhCliClient;
 #[async_trait::async_trait]
 impl GitHubClient for GhCliClient {
     async fn api(&self, endpoint: &str, jq: &str) -> Result<String> {
-        let output = tokio::process::Command::new("gh")
-            .args(["api", endpoint, "--jq", jq])
-            .output()
-            .await?;
+        let output = timeout(
+            GH_API_TIMEOUT,
+            tokio::process::Command::new("gh")
+                .args(["api", endpoint, "--jq", jq])
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("gh api timed out after {}s: {endpoint}", GH_API_TIMEOUT.as_secs()))??;
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("gh api failed: {stderr}");
