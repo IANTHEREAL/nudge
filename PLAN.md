@@ -1,294 +1,295 @@
-# Nudge — Project Plan
+# Nudge — Subscription System for AI Agents
 
 ## 1. What is Nudge
 
-Nudge is an event-driven agent coordination system. It allows agents to declaratively listen to external event sources (GitHub, Calendar, etc.), get "nudged" awake when events fire, and process events in order.
+Nudge lets agents declare what they're waiting for, then get woken up when it happens.
 
-Typical usage:
-
-```
-nudge watch github <repo> pr 42          # Watch for PR status changes
-nudge watch github <repo> run 114514     # Watch for CI run results
-nudge watch calendar "1 hour"            # Wake up after 1 hour
-```
-
----
-
-## 2. Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                     Agent Skill                      │
-│              watch() / read() / ack()                │
-│                   ▲          │                       │
-│                   │    All API calls                 │
-│                   │    go through Daemon             │
-└──────────────────────────────────────────────────────┘
-                    │          │
-                    ▼          ▼
-┌──────────────────────────────────────────────────────┐
-│                      Daemon                          │
-│                                                      │
-│   ┌──────────────────────────────────────────────┐   │
-│   │  Agent Singleton Mgmt    State Machine       │   │
-│   │  Init → Sleeping → Running → Sleeping / End  │   │
-│   └──────────────────────────────────────────────┘   │
-│                    │          ▲                       │
-│          subscribe │          │ notify(agent_id)     │
-│                    ▼          │                       │
-└──────────────────────────────────────────────────────┘
-                    │          │
-                    ▼          │
-┌──────────────────────────────────────────────────────┐
-│                   Hub Service                        │
-│                                                      │
-│   ┌────────────┐  ┌────────────┐  ┌──────────────┐  │
-│   │ Subscription│  │ Event      │  │ Source       │  │
-│   │ Manager    │  │ Queue      │  │ Adapters     │  │
-│   │            │  │ (per agent) │  │ ┌──────────┐ │  │
-│   └────────────┘  └────────────┘  │ │ GitHub   │ │  │
-│                                   │ │ Timer    │ │  │
-│                                   │ │ Webhook  │ │  │
-│                                   │ └──────────┘ │  │
-│                                   └──────────────┘  │
-└──────────────────────────────────────────────────────┘
+```bash
+nudge wait github pr 42 merged         # block until PR 42 is merged
+nudge wait ci 2199 success             # block until CI passes
+nudge wait timer 30m                   # block for 30 minutes
+nudge wait issue 2208 new-comment      # block until new comment appears
 ```
 
-The three layers each have their own responsibilities:
+For cross-session use (agent exits, event fires later, new agent picks up):
 
-- **Hub Service** — Centrally manages event source subscriptions and polling; maintains an ordered event queue per agent.
-- **Daemon** — Manages agent singleton lifecycle (start, suspend, wake, destroy); the sole bridge between agents and the Hub.
-- **Agent Skill** — Agents interact with the event system via watch / read APIs; all requests are proxied through the Daemon.
-
-### Core Constraints
-
-- **Singleton**: Only one instance of a given agent exists within each Daemon.
-- **Sequential Processing**: Events are delivered to agents in arrival order; no concurrent dispatch.
-- **Batch Delivery**: On wake-up, all pending events in the queue are delivered to the agent at once.
-
-### Agent Lifecycle
-
-```
-                 watch()
-  ┌──────┐     ┌──────────┐    event arrived     ┌─────────┐
-  │ Init │────►│ Sleeping  │───────────────────►│ Running  │
-  └──────┘     └──────────┘                     └────┬─────┘
-                     ▲                                │
-                     │    processing done / watch again│
-                     └────────────────────────────────┘
-                                                      │
-                                                      │ exit
-                                                      ▼
-                                                ┌───────────┐
-                                                │Terminated │
-                                                └───────────┘
+```bash
+nudge on github pr 42 merged --run "claude -p 'PR 42 merged. Deploy to staging.'"
+nudge on ci 2199 success --run "claude -p 'CI passed. Run gate review on PR 2199.'"
+nudge on issue 2208 new-comment --run "claude -p 'New comment on #2208. Re-evaluate design.'"
 ```
 
-### Key Data Structures
+## 2. Core Concept
+
+**Nudge is a subscription system, not a notification system.**
+
+An agent declares "I care about X." How the notification arrives (polling, webhook, GitHub Actions) is an implementation detail that can change per-source without affecting the agent's code.
 
 ```
-Subscription {
-    id:         string
-    agent_id:   string
-    source:     string        // "github" | "calendar" | "webhook"
-    filter:     SourceFilter  // source-specific
-    created_at: timestamp
-}
-
-Event {
-    id:         string
-    source:     string
-    payload:    any
-    matched:    Subscription
-    timestamp:  timestamp
-    status:     "pending" | "delivered" | "acked"
-}
+┌─────────────────────────────────────┐
+│            Agent                     │
+│                                      │
+│   nudge wait <source> <condition>    │  ← one command, blocks
+│   nudge on <source> <cond> --run ... │  ← one command, exits, callback later
+│                                      │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│         Subscription Store           │
+│                                      │
+│   { source, condition, callback,     │
+│     created_at, expires_at, status } │
+│                                      │
+│   Storage: SQLite file               │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│         Condition Checker            │
+│                                      │
+│   Polling loop (configurable freq)   │
+│   + optional webhook fast-path       │
+│                                      │
+│   ┌──────────┐ ┌────────┐ ┌───────┐ │
+│   │ GitHub   │ │ Timer  │ │Webhook│ │
+│   │ (gh CLI) │ │(clock) │ │(HTTP) │ │
+│   └──────────┘ └────────┘ └───────┘ │
+└──────────────────┬───────────────────┘
+                   │ condition met
+                   ▼
+┌──────────────────────────────────────┐
+│          Dispatcher                  │
+│                                      │
+│   wait mode: unblock the caller      │
+│   on mode:   execute --run command   │
+│              (claude -p, curl, etc.) │
+└──────────────────────────────────────┘
 ```
 
-### Daemon API (called by Agent Skill)
+Two components, one process. Not three layers.
 
-```
-POST /watch   { source, filter }       → Register listener, agent suspends
-GET  /read                             → Pull triggered events for current batch
-POST /ack     { event_ids }            → Acknowledge events as processed
-```
+## 3. Two Modes
 
-### Hub ↔ Daemon Internal Protocol
+### `nudge wait` — Synchronous (agent stays alive)
 
-```
-subscribe(agent_id, source, filter) → subscription_id
-unsubscribe(subscription_id)
-pull_events(agent_id)               → Vec<Event>
-ack_events(event_ids)
-notify(agent_id)                     // Hub → Daemon wake-up notification
+Agent blocks until the condition is met. Returns the event as JSON to stdout.
+
+```bash
+EVENT=$(nudge wait github pr 42 merged --timeout 2h)
+echo $EVENT  # {"source":"github","type":"pr_merged","pr":42,"merged_at":"..."}
 ```
 
----
+Use when: short waits (CI completion, gate review result), agent session stays alive.
 
-## 3. Source Adapters
+### `nudge on` — Asynchronous (agent exits, callback later)
 
-Each event source implements a unified interface:
+Registers a persistent subscription and exits immediately. When the condition fires, nudge executes the `--run` command (typically spawning a new agent session).
 
-```
-trait SourceAdapter {
-    fn subscribe(filter: SourceFilter) -> SubscriptionHandle
-    fn unsubscribe(handle: SubscriptionHandle)
-    fn poll() -> Vec<RawEvent>
-    fn handle_webhook(req: Request)
-}
+```bash
+nudge on github pr 42 merged --run "claude -p 'PR 42 merged. Start deployment.'"
+nudge on timer 6h --run "claude -p 'Grace period expired. Revoke old password.'"
 ```
 
-Initially supported:
+Use when: long waits (human response, grace period expiry), agent session doesn't need to stay alive.
 
-| Source | Mode | Filter Example |
-|--------|------|----------------|
-| GitHub | Webhook + Poll fallback | `{ repo, event_type: "pull_request", number: 42 }` |
-| Timer  | Internal timer | `{ duration: "1h" }` or `{ cron: "0 9 * * *" }` |
-| Webhook (Generic) | Webhook | `{ path: "/hook/xxx", jmespath: "..." }` |
+## 4. Subscription Types
 
----
+| Source | Conditions | Check Method |
+|--------|-----------|--------------|
+| **github pr** | `merged`, `closed`, `review-approved`, `label:<name>`, `new-comment`, `ci-passed` | `gh api` polling (default 60s) |
+| **github issue** | `new-comment`, `closed`, `label:<name>` | `gh api` polling |
+| **github ci** | `success`, `failure`, `completed` | `gh api` polling |
+| **timer** | duration (`30m`, `6h`, `7d`) | internal clock |
+| **webhook** | path match + optional jmespath filter | HTTP listener (opt-in) |
 
-## 4. End-to-End Event Flow
+GitHub sources use `gh` CLI — no token management, no API client library. Polling is the default; webhook is an optimization added later.
 
-```
- 1. Agent calls watch(github, { repo: "foo/bar", pr: 42 })
- 2. Daemon forwards subscription → Hub Service registers it
- 3. Agent enters Sleeping state, Daemon suspends
- 4. Hub detects PR #42 change via webhook/poll
- 5. Hub generates Event, writes it to the agent's queue
- 6. Hub calls notify(agent_id) to alert the Daemon
- 7. Daemon wakes the agent
- 8. Agent calls read() → receives [evt_001, evt_002, ...]
- 9. Agent processes events
-10. Agent calls ack(event_ids)
-11. Agent decides: watch again → go to step 3 | exit → Terminated
-```
+## 5. Data Model
 
----
+One table, minimal:
 
-## 5. Division of Work
-
-Two people split by **layer**, interface-first, parallel development:
-
-| | Owner | Scope | Core Responsibilities |
-|---|---|---|---|
-| Hub Side | **A** | Hub Service + Source Adapters | Subscription management, event queue, source adapters (Timer / GitHub / Webhook), event matching & delivery |
-| Daemon Side | **B** | Daemon + Agent Skill API | Agent singleton lifecycle, state machine, watch/read/ack API, wake-up scheduling, persistence & reliability |
-
-Why split by layer:
-
-1. The Hub ↔ Daemon boundary is clean — once the protocol is defined, both sides can mock the other and develop in parallel without blocking each other.
-2. Each person has full ownership of their layer, reducing merge conflicts.
-3. Integration is concentrated at two points (Phase 2 and Phase 4); the rest of the time both sides progress independently.
-
----
-
-## 6. Development Phases
-
-### Phase 0 — Protocol Alignment (Day 1)
-
-> A + B work together. Deliverables: `protocol.md` + mocks on both sides.
-
-- [ ] Define Hub ↔ Daemon communication protocol (interfaces + example request/response) `A+B`
-- [ ] Define core data structure schemas `A+B`
-- [ ] Decide on agent suspension mechanism (tokio / goroutine / thread) `A+B`
-- [ ] A provides Hub mock for B; B provides Daemon mock for A `A+B`
-
----
-
-### Phase 1 — Core Skeleton, Parallel Development (Day 2–5)
-
-**A — Hub Service Core**
-
-- [ ] Subscription manager (CRUD + match inbound events by source/filter) `A`
-- [ ] Event queue (per-agent FIFO, in-memory, pending → delivered → acked) `A`
-- [ ] Timer Source Adapter (parse duration, fire event on expiry) `A`
-- [ ] Notification mechanism (notify Daemon mock when queue is non-empty) `A`
-- [ ] Unit tests (subscription matching, queue state transitions, Timer firing) `A`
-
-**B — Daemon + Agent Skill API**
-
-- [ ] Agent singleton manager (register / destroy / uniqueness guarantee) `B`
-- [ ] Agent state machine (Init → Sleeping → Running → Sleeping / Terminated) `B`
-- [ ] watch / read / ack API implementation `B`
-- [ ] Wake-up scheduler (receive notify → wake agent → batch pull → ordering guarantee) `B`
-- [ ] Unit tests (singleton constraint, state transitions, batch delivery ordering) `B`
-
----
-
-### Phase 2 — Integration Testing (Day 6–7)
-
-> Remove mocks, real integration, run through the Timer scenario end-to-end.
-
-- [ ] Hub ↔ Daemon real integration (replace mocks, handle serialization / errors / timeouts) `A+B`
-- [ ] E2E: `watch calendar "5s"` → fire → wake → read → ack → watch again `A+B`
-- [ ] E2E: Multiple timers batch fire → single read returns multiple events `A+B`
-
----
-
-### Phase 3 — GitHub + Persistence, Parallel Development (Day 8–12)
-
-**A — GitHub Source Adapter**
-
-- [ ] Webhook reception and signature verification `A`
-- [ ] Parse PR / Workflow Run payloads `A`
-- [ ] Poll fallback + deduplication `A`
-- [ ] Filter matching (repo + event_type + number/run_id) `A`
-- [ ] Integration tests (real webhook triggers) `A`
-
-**B — Persistence & Reliability**
-
-- [ ] Event queue persistence (SQLite / Redis Stream) `B`
-- [ ] Daemon restart recovery (pull pending events, restore agent state) `B`
-- [ ] Event retry and dead letter queue `B`
-- [ ] Integration tests (crash recovery, retry flow) `B`
-
----
-
-### Phase 4 — Integration + Wrap-up (Day 13–15)
-
-- [ ] GitHub E2E (watch PR → merge → wake; watch run → complete → wake) `A+B`
-- [ ] Edge cases (network interruption recovery, processing timeout, duplicate event dedup) `A+B`
-- [ ] Logging and metrics (queue depth, event latency, wake-up count) `A+B`
-- [ ] Documentation (API docs, Adapter development guide, operations manual) `A+B`
-
----
-
-## 7. Dependencies & Timeline
-
-```
-Day 1       Phase 0 ─── Protocol Alignment ─── A+B
-            ───────────────────────────────────────
-Day 2–5     Phase 1     A: Hub Core + Timer
-                        B: Daemon + Agent API     (parallel)
-            ───────────────────────────────────────
-Day 6–7     Phase 2 ─── Integration Testing ─── A+B
-            ───────────────────────────────────────
-Day 8–12    Phase 3     A: GitHub Adapter
-                        B: Persistence + Reliability  (parallel)
-            ───────────────────────────────────────
-Day 13–15   Phase 4 ─── Integration + Wrap-up ─── A+B
+```sql
+CREATE TABLE subscriptions (
+    id          TEXT PRIMARY KEY,
+    source      TEXT NOT NULL,      -- "github", "timer", "webhook"
+    condition   TEXT NOT NULL,       -- JSON: {"repo":"foo/bar","pr":42,"event":"merged"}
+    mode        TEXT NOT NULL,       -- "wait" or "on"
+    callback    TEXT,                -- for "on" mode: the --run command
+    status      TEXT DEFAULT 'active', -- active | fired | expired | cancelled
+    created_at  INTEGER NOT NULL,   -- epoch seconds
+    expires_at  INTEGER,            -- epoch seconds, NULL = no expiry
+    event_data  TEXT                -- JSON payload when fired
+);
 ```
 
-Out of 15 days, A and B block each other for ≤ 4 days (Phase 0 / 2 / 4); the rest can be progressed independently.
+SQLite file at `~/.nudge/subscriptions.db`. Survives process restarts, agent session restarts, machine reboots.
 
----
+## 6. Architecture: Single Process
 
-## 8. Risks & Mitigations
+```
+nudge daemon
+  ├── Subscription Store (SQLite)
+  ├── Polling Loop
+  │   ├── GitHub checker (gh api calls, batched per-repo)
+  │   ├── Timer checker (compare expires_at vs now)
+  │   └── Webhook listener (optional, opt-in via --enable-webhooks)
+  ├── Dispatcher
+  │   ├── wait mode: write to named pipe / Unix socket → unblock caller
+  │   └── on mode: spawn --run command
+  └── CLI interface
+      ├── nudge wait ...    (register + block)
+      ├── nudge on ...      (register + exit)
+      ├── nudge list        (show active subscriptions)
+      ├── nudge cancel <id> (cancel subscription)
+      └── nudge daemon      (start the background daemon)
+```
 
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| Insufficient protocol definition in Phase 0 → heavy rework in Phase 2 | High | Protocol docs must include example req/res; cross-review by both sides |
-| GitHub Webhook environment dependency → inconvenient local development | Medium | A provides a webhook replay tool to replay recorded payloads |
-| Persistence changes affect Hub internal interfaces | Medium | Hub in Phase 1 should include a storage abstraction layer; B aligns with A early |
-| Delayed decision on agent suspension mechanism | Medium | Must be decided in Phase 0; do not defer to Phase 1 |
+**Why single process:** Agent coordination systems with < 100 subscriptions don't need distributed architecture. A single daemon with SQLite handles thousands of subscriptions trivially. If scaling is ever needed (it won't be), the subscription store can be swapped to PostgreSQL without changing the API.
 
----
+**Daemon auto-start:** `nudge wait` and `nudge on` auto-start the daemon if not running (like Docker daemon). No separate startup step needed.
 
-## 9. Open Questions
+## 7. Polling Strategy
 
-1. **Multi-watch semantics** — When an agent watches multiple sources simultaneously, is the wake condition ANY or ALL? Suggestion: default to ANY.
-2. **Watch cancellation** — Is an explicit unwatch API needed? Or is it implicitly cancelled by exit / re-watch?
-3. **Event idempotency** — Does the Hub guarantee exactly-once, or does the agent handle its own dedup?
-4. **Timeout mechanism** — Maximum wait time for a sleeping agent? Prevent indefinite suspension.
-5. **Multi-Daemon instances** — How to coordinate during future scaling (distributed lock / leader election)?
+Not all subscriptions need the same frequency:
+
+| Source | Default Poll Interval | Rationale |
+|--------|----------------------|-----------|
+| github ci | 30s | CI results are time-sensitive |
+| github pr | 60s | PR events are less urgent |
+| github issue | 120s | Comment watches are low-urgency |
+| timer | N/A | Internal clock, no polling |
+| webhook | N/A | Push-based, no polling |
+
+**Batching:** Multiple subscriptions for the same repo are batched into one `gh api` call. Watching 10 PRs on the same repo costs 1 API call, not 10.
+
+**Rate limiting:** GitHub API rate limit is 5000/hour. At 60s intervals, 1 repo = 60 calls/hour. Can watch ~80 repos simultaneously before hitting limits.
+
+**Webhook fast-path (optional):** If `--enable-webhooks` is set, nudge starts an HTTP listener. GitHub webhooks provide near-instant delivery. Polling continues as fallback (webhooks can be missed).
+
+## 8. Agent Integration
+
+### With Claude Code Skills
+
+```bash
+# In a skill: after creating PR, wait for CI to pass before gate review
+gh pr create --repo $REPO --head $BRANCH --title "..." --body "..."
+EVENT=$(nudge wait ci $PR_NUMBER success --timeout 30m)
+if [ $? -eq 0 ]; then
+  /gate-review $PR_NUMBER
+fi
+```
+
+### With Harness
+
+The harness dispatcher can use `nudge on` instead of cron polling:
+
+```bash
+# Instead of cron polling labels every 5 minutes:
+nudge on github pr $PR_NUMBER label:harness:review-done \
+  --run "claude -p '/harness continue $ISSUE --repo $REPO'"
+```
+
+### Cross-Session State
+
+`nudge on` callbacks receive event data via `$NUDGE_EVENT` environment variable:
+
+```bash
+nudge on github issue 2208 new-comment \
+  --run "claude -p 'New comment on #2208. Event: \$NUDGE_EVENT'"
+```
+
+## 9. CLI Reference
+
+```
+nudge wait <source> <args> [--timeout <duration>]
+  Block until condition met. Print event JSON to stdout.
+  Exit 0 on success, 1 on timeout, 2 on error.
+
+nudge on <source> <args> --run "<command>" [--timeout <duration>]
+  Register persistent subscription. Exit 0 immediately.
+  When fired, execute <command> with $NUDGE_EVENT set.
+
+nudge list [--source <source>] [--status <status>]
+  List subscriptions.
+
+nudge cancel <id>
+  Cancel a subscription.
+
+nudge daemon [--enable-webhooks] [--webhook-port 9876]
+  Start daemon (auto-started by wait/on if not running).
+
+nudge status
+  Show daemon status, subscription count, last poll times.
+```
+
+## 10. Implementation Plan (6 days, 1 person)
+
+### Day 1: Core + Timer
+
+- [ ] SQLite schema + subscription CRUD
+- [ ] `nudge wait timer <duration>` — register + block + unblock on expiry
+- [ ] `nudge on timer <duration> --run "..."` — register + dispatch on expiry
+- [ ] `nudge list` / `nudge cancel`
+- [ ] Daemon auto-start (background process with PID file)
+- [ ] Tests: timer fires, wait unblocks, on dispatches, cancel works
+
+### Day 2: GitHub Source
+
+- [ ] GitHub condition checker (`gh api` calls, parse PR/issue/CI state)
+- [ ] `nudge wait github pr <n> merged` — poll until condition, unblock
+- [ ] `nudge wait github ci <n> success` — poll until CI green
+- [ ] `nudge wait github issue <n> new-comment` — track comment count
+- [ ] Batched polling (group by repo)
+- [ ] Tests: PR merged detected, CI status detected, comment detected
+
+### Day 3: Persistence + Reliability
+
+- [ ] Daemon restart recovery (reload active subscriptions from SQLite)
+- [ ] Expired subscription cleanup
+- [ ] `--timeout` handling (wait returns exit code 1)
+- [ ] Concurrent subscription stress test
+- [ ] `nudge status` command
+
+### Day 4: Integration + Hardening
+
+- [ ] `$NUDGE_EVENT` environment variable for `--run` callbacks
+- [ ] Retry logic for `--run` command failures
+- [ ] Logging (subscription lifecycle, poll results, dispatch events)
+- [ ] Edge cases: daemon crash during dispatch, duplicate events
+
+### Day 5: Webhook + Polish
+
+- [ ] Optional HTTP listener for webhook fast-path
+- [ ] GitHub webhook signature verification
+- [ ] `nudge wait webhook <path>` for generic webhooks
+- [ ] CLI help text and error messages
+
+### Day 6: Documentation + E2E Test
+
+- [ ] README with quick start
+- [ ] End-to-end: create PR → watch CI → gate review → watch merge → done
+- [ ] Package and release
+
+## 11. What This Design Does NOT Include
+
+Intentionally excluded:
+
+- **No Hub/Daemon separation** — single process is enough
+- **No event queue or ack semantics** — agents process events inline
+- **No agent lifecycle management** — the OS manages processes
+- **No distributed coordination** — single-machine tool
+- **No plugin/adapter trait** — new sources are added as code
+
+These can be added if proven necessary by real usage.
+
+## 12. Open Questions (Answered)
+
+| Question | Answer |
+|----------|--------|
+| Multi-watch (ANY or ALL)? | `nudge wait-any` for ANY. ALL is composition: chain subscriptions. |
+| Watch cancellation? | `nudge cancel <id>`. Also cancelled on timeout or daemon shutdown. |
+| Event idempotency? | Dedup via subscription status (fired → ignore). |
+| Timeout? | `--timeout <duration>` on every command. Default: no timeout for `on`, 1h for `wait`. |
+| Scaling? | Not needed. Single daemon handles thousands of subscriptions. |
+| Language? | Go or Rust. Single binary, no runtime dependencies. Decision made before Day 1, not during. |
