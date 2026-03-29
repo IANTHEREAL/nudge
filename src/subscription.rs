@@ -117,9 +117,8 @@ fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<
 
             // For new-comment detection, snapshot current comment count as baseline
             if event == "new-comment" {
-                if let Ok(count) = get_comment_count(repo, number) {
-                    condition["comment_count_at_subscribe"] = serde_json::json!(count);
-                }
+                let count = get_comment_count(repo, number)?;
+                condition["comment_count_at_subscribe"] = serde_json::json!(count);
             }
 
             Ok(condition)

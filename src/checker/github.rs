@@ -142,6 +142,41 @@ async fn check_new_comment(repo: &str, number: i64, sub: &Subscription) -> Resul
     }
 }
 
+/// Fetch all check runs for a commit SHA, paginating through all pages.
+async fn fetch_all_check_runs(repo: &str, sha: &str) -> Result<Vec<serde_json::Value>> {
+    let mut all_checks = Vec::new();
+    let mut page = 1u32;
+    let per_page = 100;
+
+    loop {
+        let endpoint = format!(
+            "repos/{repo}/commits/{sha}/check-runs?per_page={per_page}&page={page}"
+        );
+        let body = gh_api(&endpoint, ".").await?;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        let runs = parsed.get("check_runs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let count = runs.len();
+        for run in runs {
+            all_checks.push(serde_json::json!({
+                "name": run.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                "status": run.get("status").and_then(|v| v.as_str()).unwrap_or(""),
+                "conclusion": run.get("conclusion").and_then(|v| v.as_str()).unwrap_or(""),
+            }));
+        }
+
+        if count < per_page as usize {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(all_checks)
+}
+
 async fn check_ci(repo: &str, number: i64, expected: &str) -> Result<Option<serde_json::Value>> {
     // Try actions/runs first (works for both run IDs and avoids 404 on pulls/ for run IDs)
     if let Ok(status) = gh_api(
@@ -181,13 +216,8 @@ async fn check_ci(repo: &str, number: i64, expected: &str) -> Result<Option<serd
         return Ok(None);
     }
 
-    // PR-based CI check
-    let check_status = gh_api(
-        &format!("repos/{repo}/commits/{sha}/check-runs"),
-        "[.check_runs[] | {name: .name, status: .status, conclusion: .conclusion}]",
-    ).await?;
-
-    let checks: Vec<serde_json::Value> = serde_json::from_str(&check_status).unwrap_or_default();
+    // PR-based CI check — paginate to get all check runs
+    let checks = fetch_all_check_runs(repo, &sha).await?;
 
     if checks.is_empty() {
         return Ok(None);

@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use anyhow::Result;
-use tokio::time::{sleep, Duration};
+use fs2::FileExt;
+use tokio::time::{sleep, Duration, Instant};
 
 use crate::checker;
 use crate::cli::DaemonArgs;
 use crate::store::Store;
 
 const PID_FILE: &str = ".nudge/daemon.pid";
-const POLL_INTERVAL_SECS: u64 = 2; // Fast poll for timer responsiveness
+const TICK_INTERVAL_SECS: u64 = 2; // Base tick for timer responsiveness
+const GITHUB_INTERVAL_SECS: u64 = 60; // GitHub API poll interval to avoid rate limits
 
 /// Check if the daemon is already running.
 pub fn is_running() -> bool {
@@ -22,14 +25,34 @@ pub fn is_running() -> bool {
 }
 
 /// Ensure daemon is running. Start it if not.
+/// Uses file locking on the PID file to prevent TOCTOU races.
 pub fn ensure_running() -> Result<()> {
-    if is_running() {
-        return Ok(());
+    let pid_path = home_dir().join(PID_FILE);
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Open-or-create the PID file and take an exclusive lock
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&pid_path)?;
+    lock_file.lock_exclusive()?;
+
+    // Under the lock, check if daemon is already alive
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                // Already running; lock is released on drop
+                return Ok(());
+            }
+        }
     }
 
     // Start daemon as a background process with log file
     let log_dir = home_dir().join(".nudge");
-    std::fs::create_dir_all(&log_dir)?;
     let log_file = std::fs::File::create(log_dir.join("daemon.log"))?;
     let log_err = log_file.try_clone()?;
 
@@ -42,6 +65,7 @@ pub fn ensure_running() -> Result<()> {
         .spawn()?;
 
     tracing::info!(pid = child.id(), "Started daemon");
+    // Lock released on drop of lock_file
     Ok(())
 }
 
@@ -84,20 +108,44 @@ pub async fn run(_args: DaemonArgs) -> Result<()> {
     // Cleanup PID on exit
     let _guard = PidGuard(pid_path.clone());
 
+    // Track last-check time per source type for rate limiting
+    let mut last_check: HashMap<String, Instant> = HashMap::new();
+
     loop {
-        if let Err(e) = poll_cycle().await {
+        if let Err(e) = poll_cycle(&mut last_check).await {
             tracing::error!(error = %e, "Poll cycle error");
         }
-        sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        sleep(Duration::from_secs(TICK_INTERVAL_SECS)).await;
     }
 }
 
-async fn poll_cycle() -> Result<()> {
+/// Return the minimum poll interval for a given source.
+fn source_interval(source: &str) -> Duration {
+    match source {
+        "github" => Duration::from_secs(GITHUB_INTERVAL_SECS),
+        _ => Duration::from_secs(TICK_INTERVAL_SECS), // timer, etc.
+    }
+}
+
+async fn poll_cycle(last_check: &mut HashMap<String, Instant>) -> Result<()> {
     let db = Store::open_default()?;
+
+    let now = Instant::now();
 
     // Check all active subscriptions (before expiring, to avoid race at deadline boundary)
     let active = db.list_active()?;
     for sub in &active {
+        // Skip sources whose interval hasn't elapsed yet
+        let interval = source_interval(&sub.source);
+        if let Some(&last) = last_check.get(&sub.source) {
+            if now.duration_since(last) < interval {
+                continue;
+            }
+        }
+
+        // Mark this source as checked
+        last_check.insert(sub.source.clone(), now);
+
         match checker::check(sub).await {
             Ok(Some(event_data)) => {
                 // Only fire if still active (prevents double-fire)
