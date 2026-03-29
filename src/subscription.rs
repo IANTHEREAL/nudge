@@ -125,10 +125,7 @@ fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<
             Ok(condition)
         }
         "webhook" => {
-            let path = args.first().ok_or_else(|| anyhow::anyhow!("webhook requires a path"))?;
-            Ok(serde_json::json!({
-                "path": path,
-            }))
+            bail!("webhook source is not yet implemented");
         }
         _ => bail!("unknown source: {source}. Supported: github, timer, webhook"),
     }
@@ -165,6 +162,9 @@ pub fn parse_duration_secs(s: &str) -> Result<i64> {
     }
     let (num_str, unit) = s.split_at(s.len() - 1);
     let num: i64 = num_str.parse().map_err(|_| anyhow::anyhow!("invalid duration: {s}"))?;
+    if num < 0 {
+        bail!("duration must not be negative: {s}");
+    }
     match unit {
         "s" => Ok(num),
         "m" => Ok(num * 60),
@@ -184,6 +184,11 @@ mod tests {
         assert_eq!(parse_duration_secs("5m").unwrap(), 300);
         assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
         assert_eq!(parse_duration_secs("7d").unwrap(), 604800);
+    }
+
+    #[test]
+    fn test_parse_duration_negative() {
+        assert!(parse_duration_secs("-5m").is_err());
     }
 
     #[test]

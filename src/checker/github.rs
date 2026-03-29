@@ -143,35 +143,41 @@ async fn check_new_comment(repo: &str, number: i64, sub: &Subscription) -> Resul
 }
 
 async fn check_ci(repo: &str, number: i64, expected: &str) -> Result<Option<serde_json::Value>> {
-    // Get check runs for the PR's head SHA
+    // Try actions/runs first (works for both run IDs and avoids 404 on pulls/ for run IDs)
+    if let Ok(status) = gh_api(
+        &format!("repos/{repo}/actions/runs/{number}"),
+        "{status: .status, conclusion: .conclusion}",
+    ).await {
+        let parsed: serde_json::Value = serde_json::from_str(&status).unwrap_or_default();
+        let conclusion = parsed.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+        let run_status = parsed.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
+        // If we got a valid response (status is non-empty), treat as a run ID
+        if !run_status.is_empty() {
+            let fired = match expected {
+                "success" => conclusion == "success",
+                "failure" => conclusion == "failure",
+                "completed" => run_status == "completed",
+                _ => false,
+            };
+
+            if fired {
+                return Ok(Some(serde_json::json!({
+                    "source": "github", "type": "ci_result",
+                    "repo": repo, "run": number, "conclusion": conclusion,
+                })));
+            }
+            return Ok(None);
+        }
+    }
+
+    // Fall back to PR-based CI check: get head SHA from the pull request
     let sha = gh_api(
         &format!("repos/{repo}/pulls/{number}"),
         ".head.sha",
     ).await?;
 
     if sha.is_empty() {
-        // Maybe it's a run number, not a PR
-        let status = gh_api(
-            &format!("repos/{repo}/actions/runs/{number}"),
-            "{status: .status, conclusion: .conclusion}",
-        ).await?;
-        let parsed: serde_json::Value = serde_json::from_str(&status).unwrap_or_default();
-        let conclusion = parsed.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
-        let run_status = parsed.get("status").and_then(|v| v.as_str()).unwrap_or("");
-
-        let fired = match expected {
-            "success" => conclusion == "success",
-            "failure" => conclusion == "failure",
-            "completed" => run_status == "completed",
-            _ => false,
-        };
-
-        if fired {
-            return Ok(Some(serde_json::json!({
-                "source": "github", "type": "ci_result",
-                "repo": repo, "run": number, "conclusion": conclusion,
-            })));
-        }
         return Ok(None);
     }
 

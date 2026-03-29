@@ -95,13 +95,7 @@ pub async fn run(_args: DaemonArgs) -> Result<()> {
 async fn poll_cycle() -> Result<()> {
     let db = Store::open_default()?;
 
-    // Expire overdue subscriptions
-    let expired = db.expire_overdue()?;
-    if expired > 0 {
-        tracing::info!(count = expired, "Expired overdue subscriptions");
-    }
-
-    // Check all active subscriptions
+    // Check all active subscriptions (before expiring, to avoid race at deadline boundary)
     let active = db.list_active()?;
     for sub in &active {
         match checker::check(sub).await {
@@ -110,10 +104,14 @@ async fn poll_cycle() -> Result<()> {
                 if db.set_fired(&sub.id, &event_data)? {
                     tracing::info!(id = %sub.id, source = %sub.source, "Condition met!");
 
-                    // Dispatch callback for "on" mode
+                    // Dispatch callback for "on" mode (detached so it doesn't block the poll loop)
                     if sub.mode == "on" {
                         if let Some(callback) = &sub.callback {
-                            dispatch_callback(callback, &event_data).await;
+                            let cmd = callback.clone();
+                            let data = event_data.clone();
+                            tokio::spawn(async move {
+                                dispatch_callback(&cmd, &data).await;
+                            });
                         }
                     }
                 }
@@ -123,6 +121,12 @@ async fn poll_cycle() -> Result<()> {
                 tracing::warn!(id = %sub.id, error = %e, "Check failed");
             }
         }
+    }
+
+    // Expire overdue subscriptions (after condition checks to avoid race at deadline boundary)
+    let expired = db.expire_overdue()?;
+    if expired > 0 {
+        tracing::info!(count = expired, "Expired overdue subscriptions");
     }
 
     Ok(())
