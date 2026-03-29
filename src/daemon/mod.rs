@@ -103,6 +103,15 @@ pub async fn run(_args: DaemonArgs) -> Result<()> {
     }
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
+    // Acquire and hold flock for daemon lifetime (serializes startup)
+    let _lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&pid_path)?;
+    _lock_file.lock_exclusive()?;
+
     tracing::info!(pid = std::process::id(), "Daemon started");
 
     // Cleanup PID on exit
@@ -132,19 +141,29 @@ async fn poll_cycle(last_check: &mut HashMap<String, Instant>) -> Result<()> {
 
     let now = Instant::now();
 
-    // Check all active subscriptions (before expiring, to avoid race at deadline boundary)
+    // Determine which sources are due for checking this cycle
     let active = db.list_active()?;
+    let mut sources_due: std::collections::HashSet<String> = std::collections::HashSet::new();
     for sub in &active {
-        // Skip sources whose interval hasn't elapsed yet
-        let interval = source_interval(&sub.source);
-        if let Some(&last) = last_check.get(&sub.source) {
-            if now.duration_since(last) < interval {
-                continue;
-            }
+        if sources_due.contains(&sub.source) {
+            continue; // already determined this source is due
         }
+        let interval = source_interval(&sub.source);
+        let due = match last_check.get(&sub.source) {
+            Some(&last) => now.duration_since(last) >= interval,
+            None => true,
+        };
+        if due {
+            sources_due.insert(sub.source.clone());
+            last_check.insert(sub.source.clone(), now);
+        }
+    }
 
-        // Mark this source as checked
-        last_check.insert(sub.source.clone(), now);
+    // Check all active subscriptions whose source is due
+    for sub in &active {
+        if !sources_due.contains(&sub.source) {
+            continue;
+        }
 
         match checker::check(sub).await {
             Ok(Some(event_data)) => {

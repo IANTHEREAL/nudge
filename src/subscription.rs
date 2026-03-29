@@ -104,6 +104,8 @@ fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<
             let number: i64 = args[1].parse().map_err(|_| anyhow::anyhow!("invalid number: {}", args[1]))?;
             let event = &args[2];   // merged, closed, new-comment, success, etc.
 
+            validate_github_kind_event(kind, event)?;
+
             let detected = detect_repo();
             let repo = repo.or(detected.as_deref())
                 .ok_or_else(|| anyhow::anyhow!("--repo is required (or run from a git repo)"))?;
@@ -128,6 +130,22 @@ fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<
         }
         _ => bail!("unknown source: {source}. Supported: github, timer, webhook"),
     }
+}
+
+fn validate_github_kind_event(kind: &str, event: &str) -> Result<()> {
+    let valid_events: &[&str] = match kind {
+        "pr" => &["merged", "closed", "new-comment"],
+        "issue" => &["closed", "new-comment"],
+        "ci" => &["success", "failure", "completed"],
+        _ => bail!("invalid github kind: {kind}. Supported: pr, issue, ci"),
+    };
+    if !valid_events.contains(&event) {
+        bail!(
+            "invalid event '{event}' for github kind '{kind}'. Supported: {}",
+            valid_events.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn get_comment_count(repo: &str, number: i64) -> Result<i64> {
@@ -195,6 +213,17 @@ mod tests {
         let cond = parse_condition("timer", &["30m".into()], None).unwrap();
         assert_eq!(cond["duration"], "30m");
         assert!(cond["fire_at"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn test_validate_github_kind_event() {
+        assert!(validate_github_kind_event("pr", "merged").is_ok());
+        assert!(validate_github_kind_event("pr", "closed").is_ok());
+        assert!(validate_github_kind_event("issue", "closed").is_ok());
+        assert!(validate_github_kind_event("ci", "success").is_ok());
+        assert!(validate_github_kind_event("pr", "bogus").is_err());
+        assert!(validate_github_kind_event("unknown", "merged").is_err());
+        assert!(validate_github_kind_event("ci", "merged").is_err());
     }
 
     #[test]
