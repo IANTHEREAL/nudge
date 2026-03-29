@@ -188,6 +188,9 @@ async fn poll_cycle<C: GitHubClient>(last_check: &mut HashMap<String, Instant>, 
                 if db.set_fired(&sub.id, &event_data)? {
                     tracing::info!(id = %sub.id, source = %sub.source, "Condition met!");
 
+                    // "on" mode is one-shot by design: the callback fires once, then the
+                    // subscription is marked "fired" and never re-checked. For recurring
+                    // behavior, users re-subscribe inside the callback.
                     if sub.mode == "on" {
                         if let Some(callback) = &sub.callback {
                             let cmd = callback.clone();

@@ -105,12 +105,11 @@ async fn check_pr_closed<C: GitHubClient>(client: &C, repo: &str, number: i64) -
 async fn check_label<C: GitHubClient>(
     client: &C, repo: &str, number: i64, label: &str, kind: &str, was_present: bool,
 ) -> Result<Option<serde_json::Value>> {
-    let endpoint = match kind {
-        "pr" => format!("repos/{repo}/pulls/{number}"),
-        _ => format!("repos/{repo}/issues/{number}"),
-    };
-    let labels = client.api(&endpoint, "[.labels[].name] | join(\",\")").await?;
-    let is_present = labels.split(',').any(|l| l.trim() == label);
+    // GitHub exposes labels on the /issues endpoint for both PRs and issues.
+    let endpoint = format!("repos/{repo}/issues/{number}");
+    let labels_json = client.api(&endpoint, "[.labels[].name]").await?;
+    let label_list: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
+    let is_present = label_list.iter().any(|l| l == label);
 
     if is_present && !was_present {
         let mut event = serde_json::json!({
@@ -341,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn test_label_fires_when_added() {
         let mut client = MockGitHubClient::new();
-        client.mock("repos/foo/bar/pulls/42", "[.labels[].name] | join(\",\")", "ready,urgent");
+        client.mock("repos/foo/bar/issues/42", "[.labels[].name]", r#"["ready","urgent"]"#);
         let cond = GitHubCondition::PrLabel {
             repo: "foo/bar".into(), number: 42,
             name: "ready".into(), present_at_subscribe: false,
@@ -356,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn test_label_does_not_fire_when_already_present() {
         let mut client = MockGitHubClient::new();
-        client.mock("repos/foo/bar/pulls/42", "[.labels[].name] | join(\",\")", "ready");
+        client.mock("repos/foo/bar/issues/42", "[.labels[].name]", r#"["ready"]"#);
         let cond = GitHubCondition::PrLabel {
             repo: "foo/bar".into(), number: 42,
             name: "ready".into(), present_at_subscribe: true,
@@ -367,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn test_label_not_present() {
         let mut client = MockGitHubClient::new();
-        client.mock("repos/foo/bar/pulls/42", "[.labels[].name] | join(\",\")", "other");
+        client.mock("repos/foo/bar/issues/42", "[.labels[].name]", r#"["other"]"#);
         let cond = GitHubCondition::PrLabel {
             repo: "foo/bar".into(), number: 42,
             name: "ready".into(), present_at_subscribe: false,
@@ -378,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn test_issue_label_fires() {
         let mut client = MockGitHubClient::new();
-        client.mock("repos/foo/bar/issues/5", "[.labels[].name] | join(\",\")", "bug");
+        client.mock("repos/foo/bar/issues/5", "[.labels[].name]", r#"["bug"]"#);
         let cond = GitHubCondition::IssueLabel {
             repo: "foo/bar".into(), number: 5,
             name: "bug".into(), present_at_subscribe: false,

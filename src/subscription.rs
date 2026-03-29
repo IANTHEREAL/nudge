@@ -187,19 +187,18 @@ fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<
     }
 }
 
-fn check_label_present(repo: &str, kind: &str, number: i64, label: &str) -> Result<bool> {
-    let endpoint = match kind {
-        "pr" => format!("repos/{repo}/pulls/{number}"),
-        _ => format!("repos/{repo}/issues/{number}"),
-    };
+fn check_label_present(repo: &str, _kind: &str, number: i64, label: &str) -> Result<bool> {
+    // GitHub exposes labels on the /issues endpoint for both PRs and issues.
+    let endpoint = format!("repos/{repo}/issues/{number}");
     let output = std::process::Command::new("gh")
-        .args(["api", &endpoint, "--jq", "[.labels[].name] | join(\",\")"])
+        .args(["api", &endpoint, "--jq", "[.labels[].name]"])
         .output()?;
     if !output.status.success() {
         bail!("failed to check labels");
     }
-    let labels = String::from_utf8_lossy(&output.stdout);
-    Ok(labels.split(',').any(|l| l.trim() == label))
+    let labels_json = String::from_utf8_lossy(&output.stdout);
+    let label_list: Vec<String> = serde_json::from_str(labels_json.trim()).unwrap_or_default();
+    Ok(label_list.iter().any(|l| l == label))
 }
 
 fn get_comment_count(repo: &str, number: i64) -> Result<i64> {
