@@ -108,12 +108,21 @@ fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<
             let repo = repo.or(detected.as_deref())
                 .ok_or_else(|| anyhow::anyhow!("--repo is required (or run from a git repo)"))?;
 
-            Ok(serde_json::json!({
+            let mut condition = serde_json::json!({
                 "kind": kind,
                 "number": number,
                 "event": event,
                 "repo": repo,
-            }))
+            });
+
+            // For new-comment detection, snapshot current comment count as baseline
+            if event == "new-comment" {
+                if let Ok(count) = get_comment_count(repo, number) {
+                    condition["comment_count_at_subscribe"] = serde_json::json!(count);
+                }
+            }
+
+            Ok(condition)
         }
         "webhook" => {
             let path = args.first().ok_or_else(|| anyhow::anyhow!("webhook requires a path"))?;
@@ -123,6 +132,17 @@ fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<
         }
         _ => bail!("unknown source: {source}. Supported: github, timer, webhook"),
     }
+}
+
+fn get_comment_count(repo: &str, number: i64) -> Result<i64> {
+    let output = std::process::Command::new("gh")
+        .args(["api", &format!("repos/{repo}/issues/{number}"), "--jq", ".comments"])
+        .output()?;
+    if !output.status.success() {
+        bail!("failed to get comment count");
+    }
+    let count: i64 = String::from_utf8_lossy(&output.stdout).trim().parse()?;
+    Ok(count)
 }
 
 fn detect_repo() -> Option<String> {

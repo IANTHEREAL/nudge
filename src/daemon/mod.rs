@@ -7,7 +7,7 @@ use crate::cli::DaemonArgs;
 use crate::store::Store;
 
 const PID_FILE: &str = ".nudge/daemon.pid";
-const POLL_INTERVAL_SECS: u64 = 10;
+const POLL_INTERVAL_SECS: u64 = 2; // Fast poll for timer responsiveness
 
 /// Check if the daemon is already running.
 pub fn is_running() -> bool {
@@ -27,13 +27,18 @@ pub fn ensure_running() -> Result<()> {
         return Ok(());
     }
 
-    // Start daemon as a background process
+    // Start daemon as a background process with log file
+    let log_dir = home_dir().join(".nudge");
+    std::fs::create_dir_all(&log_dir)?;
+    let log_file = std::fs::File::create(log_dir.join("daemon.log"))?;
+    let log_err = log_file.try_clone()?;
+
     let exe = std::env::current_exe()?;
     let child = std::process::Command::new(exe)
         .args(["daemon"])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_err))
         .spawn()?;
 
     tracing::info!(pid = child.id(), "Started daemon");
@@ -101,13 +106,15 @@ async fn poll_cycle() -> Result<()> {
     for sub in &active {
         match checker::check(sub).await {
             Ok(Some(event_data)) => {
-                tracing::info!(id = %sub.id, source = %sub.source, "Condition met!");
-                db.set_fired(&sub.id, &event_data)?;
+                // Only fire if still active (prevents double-fire)
+                if db.set_fired(&sub.id, &event_data)? {
+                    tracing::info!(id = %sub.id, source = %sub.source, "Condition met!");
 
-                // Dispatch callback for "on" mode
-                if sub.mode == "on" {
-                    if let Some(callback) = &sub.callback {
-                        dispatch_callback(callback, &event_data).await;
+                    // Dispatch callback for "on" mode
+                    if sub.mode == "on" {
+                        if let Some(callback) = &sub.callback {
+                            dispatch_callback(callback, &event_data).await;
+                        }
                     }
                 }
             }

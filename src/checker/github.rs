@@ -121,12 +121,6 @@ async fn check_issue_label(repo: &str, number: i64, label: &str) -> Result<Optio
 
 async fn check_new_comment(repo: &str, number: i64, sub: &Subscription) -> Result<Option<serde_json::Value>> {
     let count_str = gh_api(
-        &format!("repos/{repo}/issues/{number}/comments?per_page=1"),
-        "length",
-    ).await?;
-    // Use total count from headers — but gh api doesn't expose that easily.
-    // Instead, get the comment count from the issue itself.
-    let count_str = gh_api(
         &format!("repos/{repo}/issues/{number}"),
         ".comments",
     ).await?;

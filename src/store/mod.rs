@@ -17,6 +17,7 @@ pub struct Store {
 impl Store {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS subscriptions (
                 id          TEXT PRIMARY KEY,
@@ -36,7 +37,7 @@ impl Store {
     }
 
     pub fn open_default() -> Result<Self> {
-        let dir = dirs_next().join("nudge");
+        let dir = dirs_next().join(".nudge");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("subscriptions.db");
         Self::open(path.to_str().unwrap())
@@ -115,12 +116,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_fired(&self, id: &str, event_data: &serde_json::Value) -> Result<()> {
-        self.conn.execute(
-            "UPDATE subscriptions SET status = 'fired', event_data = ?1 WHERE id = ?2",
+    pub fn set_fired(&self, id: &str, event_data: &serde_json::Value) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE subscriptions SET status = 'fired', event_data = ?1 WHERE id = ?2 AND status = 'active'",
             params![serde_json::to_string(event_data)?, id],
         )?;
-        Ok(())
+        Ok(rows > 0)
     }
 
     pub fn expire_overdue(&self) -> Result<usize> {
