@@ -9,47 +9,50 @@ use crate::cli::DaemonArgs;
 use crate::store::Store;
 
 const PID_FILE: &str = ".nudge/daemon.pid";
+const LOCK_FILE: &str = ".nudge/daemon.lock";
 const TICK_INTERVAL_SECS: u64 = 2; // Base tick for timer responsiveness
 const GITHUB_INTERVAL_SECS: u64 = 60; // GitHub API poll interval to avoid rate limits
 
-/// Check if the daemon is already running.
+/// Check if the daemon is already running by trying to acquire the lock file.
 pub fn is_running() -> bool {
-    let pid_path = home_dir().join(PID_FILE);
-    if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            // Check if process exists
-            return std::path::Path::new(&format!("/proc/{pid}")).exists();
+    let lock_path = home_dir().join(LOCK_FILE);
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        // If we can't get the lock, daemon holds it → running
+        if file.try_lock_exclusive().is_err() {
+            return true;
         }
+        // Got the lock → no daemon; release it
+        let _ = file.unlock();
     }
     false
 }
 
 /// Ensure daemon is running. Start it if not.
-/// Uses file locking on the PID file to prevent TOCTOU races.
+/// Uses a non-blocking try_lock on the lock file to check if daemon is alive.
 pub fn ensure_running() -> Result<()> {
-    let pid_path = home_dir().join(PID_FILE);
-    if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let lock_path = home_dir().join(LOCK_FILE);
+    if let Some(parent) = lock_path.parent() {
+        ensure_dir(parent)?;
     }
 
-    // Open-or-create the PID file and take an exclusive lock
+    // Try to acquire the daemon lock file (non-blocking)
     let lock_file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&pid_path)?;
-    lock_file.lock_exclusive()?;
+        .open(&lock_path)?;
 
-    // Under the lock, check if daemon is already alive
-    if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                // Already running; lock is released on drop
-                return Ok(());
-            }
-        }
+    if lock_file.try_lock_exclusive().is_err() {
+        // Daemon already holds the lock → it's running
+        return Ok(());
     }
+    // We got the lock → no daemon running. Release it before spawning.
+    lock_file.unlock()?;
 
     // Start daemon as a background process with log file
     let log_dir = home_dir().join(".nudge");
@@ -65,7 +68,6 @@ pub fn ensure_running() -> Result<()> {
         .spawn()?;
 
     tracing::info!(pid = child.id(), "Started daemon");
-    // Lock released on drop of lock_file
     Ok(())
 }
 
@@ -96,21 +98,23 @@ pub async fn wait_for(id: &str) -> Result<serde_json::Value> {
 
 /// Run the daemon main loop.
 pub async fn run(_args: DaemonArgs) -> Result<()> {
-    // Write PID file
+    let lock_path = home_dir().join(LOCK_FILE);
     let pid_path = home_dir().join(PID_FILE);
-    if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if let Some(parent) = lock_path.parent() {
+        ensure_dir(parent)?;
     }
-    std::fs::write(&pid_path, std::process::id().to_string())?;
 
-    // Acquire and hold flock for daemon lifetime (serializes startup)
+    // Acquire and hold lock file for daemon lifetime (singleton)
     let _lock_file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&pid_path)?;
+        .open(&lock_path)?;
     _lock_file.lock_exclusive()?;
+
+    // Write PID to separate file (for diagnostics only)
+    std::fs::write(&pid_path, std::process::id().to_string())?;
 
     tracing::info!(pid = std::process::id(), "Daemon started");
 
@@ -230,6 +234,19 @@ fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Create directory with mode 0700 (owner-only access).
+fn ensure_dir(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        std::fs::create_dir_all(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
 }
 
 struct PidGuard(PathBuf);

@@ -133,8 +133,16 @@ fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<
 }
 
 fn validate_github_kind_event(kind: &str, event: &str) -> Result<()> {
+    // Events starting with "label:" are valid for pr and issue kinds
+    if event.starts_with("label:") {
+        if kind == "pr" || kind == "issue" {
+            return Ok(());
+        }
+        bail!("label events are only supported for pr and issue kinds, not '{kind}'");
+    }
+
     let valid_events: &[&str] = match kind {
-        "pr" => &["merged", "closed", "new-comment"],
+        "pr" => &["merged", "closed", "new-comment", "ci-passed"],
         "issue" => &["closed", "new-comment"],
         "ci" => &["success", "failure", "completed"],
         _ => bail!("invalid github kind: {kind}. Supported: pr, issue, ci"),
@@ -219,11 +227,15 @@ mod tests {
     fn test_validate_github_kind_event() {
         assert!(validate_github_kind_event("pr", "merged").is_ok());
         assert!(validate_github_kind_event("pr", "closed").is_ok());
+        assert!(validate_github_kind_event("pr", "ci-passed").is_ok());
+        assert!(validate_github_kind_event("pr", "label:ready-to-merge").is_ok());
         assert!(validate_github_kind_event("issue", "closed").is_ok());
+        assert!(validate_github_kind_event("issue", "label:bug").is_ok());
         assert!(validate_github_kind_event("ci", "success").is_ok());
         assert!(validate_github_kind_event("pr", "bogus").is_err());
         assert!(validate_github_kind_event("unknown", "merged").is_err());
         assert!(validate_github_kind_event("ci", "merged").is_err());
+        assert!(validate_github_kind_event("ci", "label:foo").is_err());
     }
 
     #[test]

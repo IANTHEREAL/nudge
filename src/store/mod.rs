@@ -38,7 +38,14 @@ impl Store {
 
     pub fn open_default() -> Result<Self> {
         let dir = dirs_next().join(".nudge");
-        std::fs::create_dir_all(&dir)?;
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
         let path = dir.join("subscriptions.db");
         Self::open(path.to_str().unwrap())
     }
