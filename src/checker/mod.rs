@@ -2,17 +2,14 @@ pub mod timer;
 pub mod github;
 
 use anyhow::Result;
-use crate::subscription::Subscription;
+use crate::subscription::{Condition, Subscription};
+use crate::checker::github::GitHubClient;
 
 /// Check if a subscription's condition has been met.
 /// Returns Some(event_data) if fired, None if not yet.
-pub async fn check(sub: &Subscription) -> Result<Option<serde_json::Value>> {
-    match sub.source.as_str() {
-        "timer" => timer::check(sub),
-        "github" => github::check(sub).await,
-        other => {
-            tracing::warn!(source = other, "Unknown source, skipping");
-            Ok(None)
-        }
+pub async fn check<C: GitHubClient>(sub: &Subscription, client: &C) -> Result<Option<serde_json::Value>> {
+    match &sub.condition {
+        Condition::Timer { fire_at, duration } => timer::check(*fire_at, duration),
+        Condition::GitHub(gh_cond) => github::check(gh_cond, client).await,
     }
 }

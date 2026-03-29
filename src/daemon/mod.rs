@@ -1,61 +1,38 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use anyhow::Result;
-use fs2::FileExt;
 use tokio::time::{sleep, Duration, Instant};
 
 use crate::checker;
+use crate::checker::github::{GhCliClient, GitHubClient};
 use crate::cli::DaemonArgs;
 use crate::store::Store;
 
-const PID_FILE: &str = ".nudge/daemon.pid";
-const LOCK_FILE: &str = ".nudge/daemon.lock";
-const TICK_INTERVAL_SECS: u64 = 2; // Base tick for timer responsiveness
-const GITHUB_INTERVAL_SECS: u64 = 60; // GitHub API poll interval to avoid rate limits
+const SOCK_NAME: &str = "daemon.sock";
+const TICK_INTERVAL_SECS: u64 = 2;
+const GITHUB_INTERVAL_SECS: u64 = 60;
 
-/// Check if the daemon is already running by trying to acquire the lock file.
+/// Check if the daemon is already running by trying to connect to the Unix socket.
 pub fn is_running() -> bool {
-    let lock_path = home_dir().join(LOCK_FILE);
-    if let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-    {
-        // If we can't get the lock, daemon holds it → running
-        if file.try_lock_exclusive().is_err() {
-            return true;
-        }
-        // Got the lock → no daemon; release it
-        let _ = file.unlock();
-    }
-    false
+    let sock_path = nudge_dir().join(SOCK_NAME);
+    std::os::unix::net::UnixStream::connect(&sock_path).is_ok()
 }
 
 /// Ensure daemon is running. Start it if not.
-/// Uses a non-blocking try_lock on the lock file to check if daemon is alive.
+/// Uses Unix domain socket connect() as health check — no TOCTOU race.
 pub fn ensure_running() -> Result<()> {
-    let lock_path = home_dir().join(LOCK_FILE);
-    if let Some(parent) = lock_path.parent() {
-        ensure_dir(parent)?;
-    }
+    let sock_path = nudge_dir().join(SOCK_NAME);
+    ensure_dir(&nudge_dir())?;
 
-    // Try to acquire the daemon lock file (non-blocking)
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
-
-    if lock_file.try_lock_exclusive().is_err() {
-        // Daemon already holds the lock → it's running
+    // If we can connect, daemon is alive
+    if std::os::unix::net::UnixStream::connect(&sock_path).is_ok() {
         return Ok(());
     }
-    // We got the lock → no daemon running. Release it before spawning.
-    lock_file.unlock()?;
 
-    // Start daemon as a background process with log file
-    let log_dir = home_dir().join(".nudge");
+    // Stale socket or no socket — clean up and spawn
+    let _ = std::fs::remove_file(&sock_path);
+
+    let log_dir = nudge_dir();
     let log_file = std::fs::File::create(log_dir.join("daemon.log"))?;
     let log_err = log_file.try_clone()?;
 
@@ -68,7 +45,16 @@ pub fn ensure_running() -> Result<()> {
         .spawn()?;
 
     tracing::info!(pid = child.id(), "Started daemon");
-    Ok(())
+
+    // Poll for readiness — daemon binds socket on startup
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if std::os::unix::net::UnixStream::connect(&sock_path).is_ok() {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("Daemon failed to start within 2s")
 }
 
 /// Wait for a subscription to be fired. Polls the store.
@@ -97,35 +83,44 @@ pub async fn wait_for(id: &str) -> Result<serde_json::Value> {
 }
 
 /// Run the daemon main loop.
+/// bind() on the Unix socket is atomic at the kernel level — two daemons cannot both succeed.
 pub async fn run(_args: DaemonArgs) -> Result<()> {
-    let lock_path = home_dir().join(LOCK_FILE);
-    let pid_path = home_dir().join(PID_FILE);
-    if let Some(parent) = lock_path.parent() {
-        ensure_dir(parent)?;
-    }
+    let sock_path = nudge_dir().join(SOCK_NAME);
+    ensure_dir(&nudge_dir())?;
 
-    // Acquire and hold lock file for daemon lifetime (singleton)
-    let _lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    _lock_file.lock_exclusive()?;
+    // Atomic singleton: bind() fails if another daemon holds the socket
+    let listener = match tokio::net::UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Check if the other daemon is actually alive
+            if std::os::unix::net::UnixStream::connect(&sock_path).is_ok() {
+                tracing::info!("Another daemon is already running");
+                return Ok(());
+            }
+            // Stale socket from a crashed daemon — remove and retry
+            std::fs::remove_file(&sock_path)?;
+            tokio::net::UnixListener::bind(&sock_path)?
+        }
+        Err(e) => return Err(e.into()),
+    };
 
-    // Write PID to separate file (for diagnostics only)
-    std::fs::write(&pid_path, std::process::id().to_string())?;
+    // Clean up socket file on exit
+    let _guard = SocketGuard(sock_path);
 
     tracing::info!(pid = std::process::id(), "Daemon started");
 
-    // Cleanup PID on exit
-    let _guard = PidGuard(pid_path.clone());
+    // Accept connections for health checks (and future RPC)
+    tokio::spawn(async move {
+        loop {
+            let _ = listener.accept().await;
+        }
+    });
 
-    // Track last-check time per source type for rate limiting
+    let client = GhCliClient;
     let mut last_check: HashMap<String, Instant> = HashMap::new();
 
     loop {
-        if let Err(e) = poll_cycle(&mut last_check).await {
+        if let Err(e) = poll_cycle(&mut last_check, &client).await {
             tracing::error!(error = %e, "Poll cycle error");
         }
         sleep(Duration::from_secs(TICK_INTERVAL_SECS)).await;
@@ -136,21 +131,20 @@ pub async fn run(_args: DaemonArgs) -> Result<()> {
 fn source_interval(source: &str) -> Duration {
     match source {
         "github" => Duration::from_secs(GITHUB_INTERVAL_SECS),
-        _ => Duration::from_secs(TICK_INTERVAL_SECS), // timer, etc.
+        _ => Duration::from_secs(TICK_INTERVAL_SECS),
     }
 }
 
-async fn poll_cycle(last_check: &mut HashMap<String, Instant>) -> Result<()> {
+async fn poll_cycle<C: GitHubClient>(last_check: &mut HashMap<String, Instant>, client: &C) -> Result<()> {
     let db = Store::open_default()?;
 
     let now = Instant::now();
 
-    // Determine which sources are due for checking this cycle
     let active = db.list_active()?;
     let mut sources_due: std::collections::HashSet<String> = std::collections::HashSet::new();
     for sub in &active {
         if sources_due.contains(&sub.source) {
-            continue; // already determined this source is due
+            continue;
         }
         let interval = source_interval(&sub.source);
         let due = match last_check.get(&sub.source) {
@@ -163,19 +157,16 @@ async fn poll_cycle(last_check: &mut HashMap<String, Instant>) -> Result<()> {
         }
     }
 
-    // Check all active subscriptions whose source is due
     for sub in &active {
         if !sources_due.contains(&sub.source) {
             continue;
         }
 
-        match checker::check(sub).await {
+        match checker::check(sub, client).await {
             Ok(Some(event_data)) => {
-                // Only fire if still active (prevents double-fire)
                 if db.set_fired(&sub.id, &event_data)? {
                     tracing::info!(id = %sub.id, source = %sub.source, "Condition met!");
 
-                    // Dispatch callback for "on" mode (detached so it doesn't block the poll loop)
                     if sub.mode == "on" {
                         if let Some(callback) = &sub.callback {
                             let cmd = callback.clone();
@@ -187,14 +178,13 @@ async fn poll_cycle(last_check: &mut HashMap<String, Instant>) -> Result<()> {
                     }
                 }
             }
-            Ok(None) => {} // not yet
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!(id = %sub.id, error = %e, "Check failed");
             }
         }
     }
 
-    // Expire overdue subscriptions (after condition checks to avoid race at deadline boundary)
     let expired = db.expire_overdue()?;
     if expired > 0 {
         tracing::info!(count = expired, "Expired overdue subscriptions");
@@ -236,6 +226,10 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn nudge_dir() -> PathBuf {
+    home_dir().join(".nudge")
+}
+
 /// Create directory with mode 0700 (owner-only access).
 fn ensure_dir(path: &std::path::Path) -> Result<()> {
     if !path.exists() {
@@ -249,9 +243,10 @@ fn ensure_dir(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-struct PidGuard(PathBuf);
+/// RAII guard that removes the socket file on drop.
+struct SocketGuard(PathBuf);
 
-impl Drop for PidGuard {
+impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }

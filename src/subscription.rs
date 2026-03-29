@@ -4,11 +4,50 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::{OnArgs, WaitArgs};
 
+/// Typed condition enum — replaces raw serde_json::Value.
+/// Stored as JSON string in SQLite, but in-memory it's typed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "source", content = "condition")]
+pub enum Condition {
+    Timer {
+        duration: String,
+        fire_at: i64,
+    },
+    GitHub(GitHubCondition),
+}
+
+impl Condition {
+    pub fn source_name(&self) -> &str {
+        match self {
+            Condition::Timer { .. } => "timer",
+            Condition::GitHub(_) => "github",
+        }
+    }
+}
+
+/// Typed GitHub condition — compiler enforces exhaustive matching (no silent `_ =>` arm).
+/// Each variant carries its required baseline data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event")]
+pub enum GitHubCondition {
+    PrMerged { repo: String, number: i64 },
+    PrClosed { repo: String, number: i64 },
+    PrLabel { repo: String, number: i64, name: String, present_at_subscribe: bool },
+    PrNewComment { repo: String, number: i64, baseline: i64 },
+    PrCiPassed { repo: String, number: i64 },
+    IssueClosed { repo: String, number: i64 },
+    IssueLabel { repo: String, number: i64, name: String, present_at_subscribe: bool },
+    IssueNewComment { repo: String, number: i64, baseline: i64 },
+    CiSuccess { repo: String, number: i64 },
+    CiFailure { repo: String, number: i64 },
+    CiCompleted { repo: String, number: i64 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub id: String,
     pub source: String,
-    pub condition: serde_json::Value,
+    pub condition: Condition,
     pub mode: String,       // "wait" or "on"
     pub callback: Option<String>,
     pub status: String,     // "active", "fired", "expired", "cancelled"
@@ -25,7 +64,7 @@ impl Subscription {
 
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
-            source: args.source.clone(),
+            source: condition.source_name().to_string(),
             condition,
             mode: "wait".into(),
             callback: None,
@@ -43,7 +82,7 @@ impl Subscription {
 
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
-            source: args.source.clone(),
+            source: condition.source_name().to_string(),
             condition,
             mode: "on".into(),
             callback: Some(args.run.clone()),
@@ -55,25 +94,25 @@ impl Subscription {
     }
 
     pub fn condition_summary(&self) -> String {
-        match self.source.as_str() {
-            "timer" => {
-                if let Some(dur) = self.condition.get("duration").and_then(|v| v.as_str()) {
-                    format!("timer {dur}")
-                } else {
-                    "timer".into()
-                }
-            }
-            "github" => {
-                let kind = self.condition.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-                let number = self.condition.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
-                let event = self.condition.get("event").and_then(|v| v.as_str()).unwrap_or("?");
-                let repo = self.condition.get("repo").and_then(|v| v.as_str()).unwrap_or("");
-                format!("{repo} {kind} #{number} {event}")
-            }
-            _ => format!("{}", self.condition),
+        match &self.condition {
+            Condition::Timer { duration, .. } => format!("timer {duration}"),
+            Condition::GitHub(gh) => match gh {
+                GitHubCondition::PrMerged { repo, number } => format!("{repo} pr #{number} merged"),
+                GitHubCondition::PrClosed { repo, number } => format!("{repo} pr #{number} closed"),
+                GitHubCondition::PrLabel { repo, number, name, .. } => format!("{repo} pr #{number} label:{name}"),
+                GitHubCondition::PrNewComment { repo, number, .. } => format!("{repo} pr #{number} new-comment"),
+                GitHubCondition::PrCiPassed { repo, number } => format!("{repo} pr #{number} ci-passed"),
+                GitHubCondition::IssueClosed { repo, number } => format!("{repo} issue #{number} closed"),
+                GitHubCondition::IssueLabel { repo, number, name, .. } => format!("{repo} issue #{number} label:{name}"),
+                GitHubCondition::IssueNewComment { repo, number, .. } => format!("{repo} issue #{number} new-comment"),
+                GitHubCondition::CiSuccess { repo, number } => format!("{repo} ci #{number} success"),
+                GitHubCondition::CiFailure { repo, number } => format!("{repo} ci #{number} failure"),
+                GitHubCondition::CiCompleted { repo, number } => format!("{repo} ci #{number} completed"),
+            },
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_expired(&self) -> bool {
         if let Some(exp) = self.expires_at {
             Utc::now().timestamp() >= exp
@@ -83,83 +122,69 @@ impl Subscription {
     }
 }
 
-fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<serde_json::Value> {
+fn parse_condition(source: &str, args: &[String], repo: Option<&str>) -> Result<Condition> {
     match source {
         "timer" => {
             let duration = args.first().ok_or_else(|| anyhow::anyhow!("timer requires a duration (e.g., 30m, 2h)"))?;
             let secs = parse_duration_secs(duration)?;
-            Ok(serde_json::json!({
-                "duration": duration,
-                "fire_at": Utc::now().timestamp() + secs,
-            }))
+            Ok(Condition::Timer {
+                duration: duration.clone(),
+                fire_at: Utc::now().timestamp() + secs,
+            })
         }
         "github" => {
-            // nudge wait github pr 42 merged --repo owner/repo
-            // nudge wait github issue 2208 new-comment --repo owner/repo
-            // nudge wait github ci 2199 success --repo owner/repo
             if args.len() < 3 {
                 bail!("github requires: <pr|issue|ci> <number> <event> [--repo owner/repo]");
             }
-            let kind = &args[0];    // pr, issue, ci
+            let kind = &args[0];
             let number: i64 = args[1].parse().map_err(|_| anyhow::anyhow!("invalid number: {}", args[1]))?;
-            let event = &args[2];   // merged, closed, new-comment, success, etc.
-
-            validate_github_kind_event(kind, event)?;
+            let event = &args[2];
 
             let detected = detect_repo();
             let repo = repo.or(detected.as_deref())
-                .ok_or_else(|| anyhow::anyhow!("--repo is required (or run from a git repo)"))?;
+                .ok_or_else(|| anyhow::anyhow!("--repo is required (or run from a git repo)"))?
+                .to_string();
 
-            let mut condition = serde_json::json!({
-                "kind": kind,
-                "number": number,
-                "event": event,
-                "repo": repo,
-            });
+            let inner = match (kind.as_str(), event.as_str()) {
+                ("pr", "merged") => GitHubCondition::PrMerged { repo, number },
+                ("pr", "closed") => GitHubCondition::PrClosed { repo, number },
+                ("pr", e) if e.starts_with("label:") => {
+                    let name = e["label:".len()..].to_string();
+                    let present = check_label_present(&repo, kind, number, &name)?;
+                    GitHubCondition::PrLabel { repo, number, name, present_at_subscribe: present }
+                }
+                ("pr", "new-comment") => {
+                    let baseline = get_comment_count(&repo, number)?;
+                    GitHubCondition::PrNewComment { repo, number, baseline }
+                }
+                ("pr", "ci-passed") => GitHubCondition::PrCiPassed { repo, number },
+                ("issue", "closed") => GitHubCondition::IssueClosed { repo, number },
+                ("issue", e) if e.starts_with("label:") => {
+                    let name = e["label:".len()..].to_string();
+                    let present = check_label_present(&repo, kind, number, &name)?;
+                    GitHubCondition::IssueLabel { repo, number, name, present_at_subscribe: present }
+                }
+                ("issue", "new-comment") => {
+                    let baseline = get_comment_count(&repo, number)?;
+                    GitHubCondition::IssueNewComment { repo, number, baseline }
+                }
+                ("ci", "success") => GitHubCondition::CiSuccess { repo, number },
+                ("ci", "failure") => GitHubCondition::CiFailure { repo, number },
+                ("ci", "completed") => GitHubCondition::CiCompleted { repo, number },
+                _ => bail!(
+                    "invalid github condition: kind={kind} event={event}. \
+                     Valid: pr (merged|closed|ci-passed|new-comment|label:X), \
+                     issue (closed|new-comment|label:X), ci (success|failure|completed)"
+                ),
+            };
 
-            // For new-comment detection, snapshot current comment count as baseline
-            if event == "new-comment" {
-                let count = get_comment_count(repo, number)?;
-                condition["comment_count_at_subscribe"] = serde_json::json!(count);
-            }
-
-            // For label events, snapshot whether label is already present
-            if let Some(label) = event.strip_prefix("label:") {
-                let present = check_label_present(repo, kind, number, label)?;
-                condition["label_present_at_subscribe"] = serde_json::json!(present);
-            }
-
-            Ok(condition)
+            Ok(Condition::GitHub(inner))
         }
         "webhook" => {
             bail!("webhook source is not yet implemented");
         }
         _ => bail!("unknown source: {source}. Supported: github, timer, webhook"),
     }
-}
-
-fn validate_github_kind_event(kind: &str, event: &str) -> Result<()> {
-    // Events starting with "label:" are valid for pr and issue kinds
-    if event.starts_with("label:") {
-        if kind == "pr" || kind == "issue" {
-            return Ok(());
-        }
-        bail!("label events are only supported for pr and issue kinds, not '{kind}'");
-    }
-
-    let valid_events: &[&str] = match kind {
-        "pr" => &["merged", "closed", "new-comment", "ci-passed"],
-        "issue" => &["closed", "new-comment"],
-        "ci" => &["success", "failure", "completed"],
-        _ => bail!("invalid github kind: {kind}. Supported: pr, issue, ci"),
-    };
-    if !valid_events.contains(&event) {
-        bail!(
-            "invalid event '{event}' for github kind '{kind}'. Supported: {}",
-            valid_events.join(", ")
-        );
-    }
-    Ok(())
 }
 
 fn check_label_present(repo: &str, kind: &str, number: i64, label: &str) -> Result<bool> {
@@ -240,23 +265,13 @@ mod tests {
     #[test]
     fn test_parse_condition_timer() {
         let cond = parse_condition("timer", &["30m".into()], None).unwrap();
-        assert_eq!(cond["duration"], "30m");
-        assert!(cond["fire_at"].as_i64().unwrap() > 0);
-    }
-
-    #[test]
-    fn test_validate_github_kind_event() {
-        assert!(validate_github_kind_event("pr", "merged").is_ok());
-        assert!(validate_github_kind_event("pr", "closed").is_ok());
-        assert!(validate_github_kind_event("pr", "ci-passed").is_ok());
-        assert!(validate_github_kind_event("pr", "label:ready-to-merge").is_ok());
-        assert!(validate_github_kind_event("issue", "closed").is_ok());
-        assert!(validate_github_kind_event("issue", "label:bug").is_ok());
-        assert!(validate_github_kind_event("ci", "success").is_ok());
-        assert!(validate_github_kind_event("pr", "bogus").is_err());
-        assert!(validate_github_kind_event("unknown", "merged").is_err());
-        assert!(validate_github_kind_event("ci", "merged").is_err());
-        assert!(validate_github_kind_event("ci", "label:foo").is_err());
+        match cond {
+            Condition::Timer { duration, fire_at } => {
+                assert_eq!(duration, "30m");
+                assert!(fire_at > 0);
+            }
+            _ => panic!("expected Timer condition"),
+        }
     }
 
     #[test]
@@ -266,9 +281,92 @@ mod tests {
             &["pr".into(), "42".into(), "merged".into()],
             Some("foo/bar"),
         ).unwrap();
-        assert_eq!(cond["kind"], "pr");
-        assert_eq!(cond["number"], 42);
-        assert_eq!(cond["event"], "merged");
-        assert_eq!(cond["repo"], "foo/bar");
+        match cond {
+            Condition::GitHub(GitHubCondition::PrMerged { repo, number }) => {
+                assert_eq!(repo, "foo/bar");
+                assert_eq!(number, 42);
+            }
+            _ => panic!("expected GitHub PrMerged condition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_condition_github_ci() {
+        let cond = parse_condition(
+            "github",
+            &["ci".into(), "999".into(), "success".into()],
+            Some("foo/bar"),
+        ).unwrap();
+        match cond {
+            Condition::GitHub(GitHubCondition::CiSuccess { repo, number }) => {
+                assert_eq!(repo, "foo/bar");
+                assert_eq!(number, 999);
+            }
+            _ => panic!("expected GitHub CiSuccess condition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_condition_invalid_kind() {
+        assert!(parse_condition(
+            "github",
+            &["bogus".into(), "1".into(), "merged".into()],
+            Some("foo/bar"),
+        ).is_err());
+    }
+
+    #[test]
+    fn test_parse_condition_invalid_event() {
+        assert!(parse_condition(
+            "github",
+            &["pr".into(), "1".into(), "bogus".into()],
+            Some("foo/bar"),
+        ).is_err());
+    }
+
+    #[test]
+    fn test_condition_serde_roundtrip() {
+        let conditions = vec![
+            Condition::Timer { duration: "30m".into(), fire_at: 12345 },
+            Condition::GitHub(GitHubCondition::PrMerged { repo: "foo/bar".into(), number: 42 }),
+            Condition::GitHub(GitHubCondition::PrLabel {
+                repo: "foo/bar".into(), number: 1, name: "ready".into(), present_at_subscribe: false,
+            }),
+            Condition::GitHub(GitHubCondition::IssueNewComment {
+                repo: "a/b".into(), number: 10, baseline: 5,
+            }),
+            Condition::GitHub(GitHubCondition::CiFailure { repo: "x/y".into(), number: 100 }),
+        ];
+        for cond in conditions {
+            let json = serde_json::to_string(&cond).unwrap();
+            let parsed: Condition = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2, "roundtrip failed for: {json}");
+        }
+    }
+
+    #[test]
+    fn test_condition_summary() {
+        let sub = Subscription {
+            id: "x".into(),
+            source: "github".into(),
+            condition: Condition::GitHub(GitHubCondition::PrMerged {
+                repo: "foo/bar".into(), number: 42,
+            }),
+            mode: "wait".into(),
+            callback: None,
+            status: "active".into(),
+            created_at: 0,
+            expires_at: None,
+            event_data: None,
+        };
+        assert_eq!(sub.condition_summary(), "foo/bar pr #42 merged");
+
+        let sub2 = Subscription {
+            condition: Condition::Timer { duration: "5m".into(), fire_at: 0 },
+            source: "timer".into(),
+            ..sub.clone()
+        };
+        assert_eq!(sub2.condition_summary(), "timer 5m");
     }
 }

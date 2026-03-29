@@ -1,55 +1,71 @@
 use anyhow::Result;
-use crate::subscription::Subscription;
+use crate::subscription::GitHubCondition;
 
-/// Check a GitHub subscription condition by calling `gh` CLI.
-pub async fn check(sub: &Subscription) -> Result<Option<serde_json::Value>> {
-    let kind = sub.condition.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    let number = sub.condition.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
-    let event = sub.condition.get("event").and_then(|v| v.as_str()).unwrap_or("");
-    let repo = sub.condition.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+/// Trait for GitHub API access — enables testing with mock responses.
+#[async_trait::async_trait]
+pub trait GitHubClient: Send + Sync {
+    async fn api(&self, endpoint: &str, jq: &str) -> Result<String>;
+}
 
-    match (kind, event) {
-        ("pr", "merged") => check_pr_merged(repo, number).await,
-        ("pr", "closed") => check_pr_closed(repo, number).await,
-        ("pr", e) if e.starts_with("label:") => {
-            let label = &e["label:".len()..];
-            let was_present = sub.condition.get("label_present_at_subscribe")
-                .and_then(|v| v.as_bool()).unwrap_or(false);
-            check_label(repo, number, label, "pr", was_present).await
+/// Production client that shells out to `gh` CLI.
+pub struct GhCliClient;
+
+#[async_trait::async_trait]
+impl GitHubClient for GhCliClient {
+    async fn api(&self, endpoint: &str, jq: &str) -> Result<String> {
+        let output = tokio::process::Command::new("gh")
+            .args(["api", endpoint, "--jq", jq])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api failed: {stderr}");
         }
-        ("pr", "new-comment") => check_new_comment(repo, number, sub).await,
-        ("pr", "ci-passed") | ("ci", "success") => check_ci(repo, number, "success").await,
-        ("ci", "failure") => check_ci(repo, number, "failure").await,
-        ("ci", "completed") => check_ci(repo, number, "completed").await,
-        ("issue", "new-comment") => check_new_comment(repo, number, sub).await,
-        ("issue", "closed") => check_issue_closed(repo, number).await,
-        ("issue", e) if e.starts_with("label:") => {
-            let label = &e["label:".len()..];
-            let was_present = sub.condition.get("label_present_at_subscribe")
-                .and_then(|v| v.as_bool()).unwrap_or(false);
-            check_label(repo, number, label, "issue", was_present).await
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+}
+
+/// Check a GitHub condition. Exhaustive match — compiler catches missing variants.
+pub async fn check<C: GitHubClient>(condition: &GitHubCondition, client: &C) -> Result<Option<serde_json::Value>> {
+    match condition {
+        GitHubCondition::PrMerged { repo, number } => {
+            check_pr_merged(client, repo, *number).await
         }
-        _ => {
-            tracing::warn!(kind, event, "Unknown github condition");
-            Ok(None)
+        GitHubCondition::PrClosed { repo, number } => {
+            check_pr_closed(client, repo, *number).await
+        }
+        GitHubCondition::PrLabel { repo, number, name, present_at_subscribe } => {
+            check_label(client, repo, *number, name, "pr", *present_at_subscribe).await
+        }
+        GitHubCondition::PrNewComment { repo, number, baseline } => {
+            check_new_comment(client, repo, *number, *baseline).await
+        }
+        GitHubCondition::PrCiPassed { repo, number } => {
+            check_ci(client, repo, *number, "success").await
+        }
+        GitHubCondition::IssueClosed { repo, number } => {
+            check_issue_closed(client, repo, *number).await
+        }
+        GitHubCondition::IssueLabel { repo, number, name, present_at_subscribe } => {
+            check_label(client, repo, *number, name, "issue", *present_at_subscribe).await
+        }
+        GitHubCondition::IssueNewComment { repo, number, baseline } => {
+            check_new_comment(client, repo, *number, *baseline).await
+        }
+        GitHubCondition::CiSuccess { repo, number } => {
+            check_ci(client, repo, *number, "success").await
+        }
+        GitHubCondition::CiFailure { repo, number } => {
+            check_ci(client, repo, *number, "failure").await
+        }
+        GitHubCondition::CiCompleted { repo, number } => {
+            check_ci(client, repo, *number, "completed").await
         }
     }
 }
 
-async fn gh_api(endpoint: &str, jq: &str) -> Result<String> {
-    let output = tokio::process::Command::new("gh")
-        .args(["api", endpoint, "--jq", jq])
-        .output()
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("gh api failed: {stderr}");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-async fn check_pr_merged(repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
-    let merged = gh_api(
+async fn check_pr_merged<C: GitHubClient>(client: &C, repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
+    let merged = client.api(
         &format!("repos/{repo}/pulls/{number}"),
         ".merged",
     ).await?;
@@ -63,8 +79,8 @@ async fn check_pr_merged(repo: &str, number: i64) -> Result<Option<serde_json::V
     }
 }
 
-async fn check_pr_closed(repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
-    let state = gh_api(
+async fn check_pr_closed<C: GitHubClient>(client: &C, repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
+    let state = client.api(
         &format!("repos/{repo}/pulls/{number}"),
         ".state",
     ).await?;
@@ -78,15 +94,16 @@ async fn check_pr_closed(repo: &str, number: i64) -> Result<Option<serde_json::V
     }
 }
 
-async fn check_label(repo: &str, number: i64, label: &str, kind: &str, was_present: bool) -> Result<Option<serde_json::Value>> {
+async fn check_label<C: GitHubClient>(
+    client: &C, repo: &str, number: i64, label: &str, kind: &str, was_present: bool,
+) -> Result<Option<serde_json::Value>> {
     let endpoint = match kind {
         "pr" => format!("repos/{repo}/pulls/{number}"),
         _ => format!("repos/{repo}/issues/{number}"),
     };
-    let labels = gh_api(&endpoint, "[.labels[].name] | join(\",\")").await?;
+    let labels = client.api(&endpoint, "[.labels[].name] | join(\",\")").await?;
     let is_present = labels.split(',').any(|l| l.trim() == label);
 
-    // Only fire if label was NOT present at subscribe time and IS present now
     if is_present && !was_present {
         let mut event = serde_json::json!({
             "source": "github", "type": "label_added",
@@ -99,8 +116,8 @@ async fn check_label(repo: &str, number: i64, label: &str, kind: &str, was_prese
     }
 }
 
-async fn check_issue_closed(repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
-    let state = gh_api(
+async fn check_issue_closed<C: GitHubClient>(client: &C, repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
+    let state = client.api(
         &format!("repos/{repo}/issues/{number}"),
         ".state",
     ).await?;
@@ -116,19 +133,15 @@ async fn check_issue_closed(repo: &str, number: i64) -> Result<Option<serde_json
 
 /// Check for new comments on an issue or PR.
 /// Note: for PRs, this only counts issue-style comments (from the "Conversation" tab),
-/// NOT PR review comments or inline code review comments. Those are a separate GitHub
-/// concept tracked via /pulls/{number}/reviews and /pulls/{number}/comments endpoints.
-async fn check_new_comment(repo: &str, number: i64, sub: &Subscription) -> Result<Option<serde_json::Value>> {
-    let count_str = gh_api(
+/// NOT PR review comments or inline code review comments.
+async fn check_new_comment<C: GitHubClient>(
+    client: &C, repo: &str, number: i64, baseline: i64,
+) -> Result<Option<serde_json::Value>> {
+    let count_str = client.api(
         &format!("repos/{repo}/issues/{number}"),
         ".comments",
     ).await?;
     let current_count: i64 = count_str.parse().unwrap_or(0);
-
-    // The baseline count is stored in the condition at subscription time.
-    let baseline = sub.condition.get("comment_count_at_subscribe")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(current_count); // If no baseline, treat current as baseline (no new comment yet)
 
     if current_count > baseline {
         Ok(Some(serde_json::json!({
@@ -142,7 +155,7 @@ async fn check_new_comment(repo: &str, number: i64, sub: &Subscription) -> Resul
 }
 
 /// Fetch all check runs for a commit SHA, paginating through all pages.
-async fn fetch_all_check_runs(repo: &str, sha: &str) -> Result<Vec<serde_json::Value>> {
+async fn fetch_all_check_runs<C: GitHubClient>(client: &C, repo: &str, sha: &str) -> Result<Vec<serde_json::Value>> {
     let mut all_checks = Vec::new();
     let mut page = 1u32;
     let per_page = 100;
@@ -151,7 +164,7 @@ async fn fetch_all_check_runs(repo: &str, sha: &str) -> Result<Vec<serde_json::V
         let endpoint = format!(
             "repos/{repo}/commits/{sha}/check-runs?per_page={per_page}&page={page}"
         );
-        let body = gh_api(&endpoint, ".").await?;
+        let body = client.api(&endpoint, ".").await?;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
         let runs = parsed.get("check_runs")
             .and_then(|v| v.as_array())
@@ -176,9 +189,9 @@ async fn fetch_all_check_runs(repo: &str, sha: &str) -> Result<Vec<serde_json::V
     Ok(all_checks)
 }
 
-async fn check_ci(repo: &str, number: i64, expected: &str) -> Result<Option<serde_json::Value>> {
+async fn check_ci<C: GitHubClient>(client: &C, repo: &str, number: i64, expected: &str) -> Result<Option<serde_json::Value>> {
     // Try actions/runs first (works for both run IDs and avoids 404 on pulls/ for run IDs)
-    if let Ok(status) = gh_api(
+    if let Ok(status) = client.api(
         &format!("repos/{repo}/actions/runs/{number}"),
         "{status: .status, conclusion: .conclusion}",
     ).await {
@@ -186,7 +199,6 @@ async fn check_ci(repo: &str, number: i64, expected: &str) -> Result<Option<serd
         let conclusion = parsed.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
         let run_status = parsed.get("status").and_then(|v| v.as_str()).unwrap_or("");
 
-        // If we got a valid response (status is non-empty), treat as a run ID
         if !run_status.is_empty() {
             let fired = match expected {
                 "success" => conclusion == "success",
@@ -206,7 +218,7 @@ async fn check_ci(repo: &str, number: i64, expected: &str) -> Result<Option<serd
     }
 
     // Fall back to PR-based CI check: get head SHA from the pull request
-    let sha = gh_api(
+    let sha = client.api(
         &format!("repos/{repo}/pulls/{number}"),
         ".head.sha",
     ).await?;
@@ -215,8 +227,7 @@ async fn check_ci(repo: &str, number: i64, expected: &str) -> Result<Option<serd
         return Ok(None);
     }
 
-    // PR-based CI check — paginate to get all check runs
-    let checks = fetch_all_check_runs(repo, &sha).await?;
+    let checks = fetch_all_check_runs(client, repo, &sha).await?;
 
     if checks.is_empty() {
         return Ok(None);
@@ -250,5 +261,259 @@ async fn check_ci(repo: &str, number: i64, expected: &str) -> Result<Option<serd
         })))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    struct MockGitHubClient {
+        responses: HashMap<(String, String), String>,
+    }
+
+    impl MockGitHubClient {
+        fn new() -> Self {
+            Self { responses: HashMap::new() }
+        }
+        fn mock(&mut self, endpoint: &str, jq: &str, response: &str) {
+            self.responses.insert((endpoint.to_string(), jq.to_string()), response.to_string());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GitHubClient for MockGitHubClient {
+        async fn api(&self, endpoint: &str, jq: &str) -> Result<String> {
+            self.responses.get(&(endpoint.to_string(), jq.to_string()))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no mock for endpoint={endpoint} jq={jq}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pr_merged_fires() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/pulls/42", ".merged", "true");
+        let cond = GitHubCondition::PrMerged { repo: "foo/bar".into(), number: 42 };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event["type"], "pr_merged");
+        assert_eq!(event["pr"], 42);
+    }
+
+    #[tokio::test]
+    async fn test_pr_merged_not_yet() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/pulls/42", ".merged", "false");
+        let cond = GitHubCondition::PrMerged { repo: "foo/bar".into(), number: 42 };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pr_closed_fires() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/pulls/10", ".state", "closed");
+        let cond = GitHubCondition::PrClosed { repo: "foo/bar".into(), number: 10 };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["type"], "pr_closed");
+    }
+
+    #[tokio::test]
+    async fn test_pr_closed_still_open() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/pulls/10", ".state", "open");
+        let cond = GitHubCondition::PrClosed { repo: "foo/bar".into(), number: 10 };
+        assert!(check(&cond, &client).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_label_fires_when_added() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/pulls/42", "[.labels[].name] | join(\",\")", "ready,urgent");
+        let cond = GitHubCondition::PrLabel {
+            repo: "foo/bar".into(), number: 42,
+            name: "ready".into(), present_at_subscribe: false,
+        };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event["type"], "label_added");
+        assert_eq!(event["label"], "ready");
+    }
+
+    #[tokio::test]
+    async fn test_label_does_not_fire_when_already_present() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/pulls/42", "[.labels[].name] | join(\",\")", "ready");
+        let cond = GitHubCondition::PrLabel {
+            repo: "foo/bar".into(), number: 42,
+            name: "ready".into(), present_at_subscribe: true,
+        };
+        assert!(check(&cond, &client).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_label_not_present() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/pulls/42", "[.labels[].name] | join(\",\")", "other");
+        let cond = GitHubCondition::PrLabel {
+            repo: "foo/bar".into(), number: 42,
+            name: "ready".into(), present_at_subscribe: false,
+        };
+        assert!(check(&cond, &client).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_issue_label_fires() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/issues/5", "[.labels[].name] | join(\",\")", "bug");
+        let cond = GitHubCondition::IssueLabel {
+            repo: "foo/bar".into(), number: 5,
+            name: "bug".into(), present_at_subscribe: false,
+        };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_new_comment_fires() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/issues/42", ".comments", "5");
+        let cond = GitHubCondition::PrNewComment {
+            repo: "foo/bar".into(), number: 42, baseline: 3,
+        };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+        let event = result.unwrap();
+        assert_eq!(event["new_count"], 5);
+        assert_eq!(event["baseline"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_new_comment_no_change() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/issues/42", ".comments", "3");
+        let cond = GitHubCondition::PrNewComment {
+            repo: "foo/bar".into(), number: 42, baseline: 3,
+        };
+        assert!(check(&cond, &client).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_issue_new_comment_fires() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/issues/10", ".comments", "8");
+        let cond = GitHubCondition::IssueNewComment {
+            repo: "foo/bar".into(), number: 10, baseline: 5,
+        };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["type"], "new_comment");
+    }
+
+    #[tokio::test]
+    async fn test_issue_closed_fires() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/issues/10", ".state", "closed");
+        let cond = GitHubCondition::IssueClosed { repo: "foo/bar".into(), number: 10 };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["type"], "issue_closed");
+    }
+
+    #[tokio::test]
+    async fn test_issue_closed_still_open() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/issues/10", ".state", "open");
+        let cond = GitHubCondition::IssueClosed { repo: "foo/bar".into(), number: 10 };
+        assert!(check(&cond, &client).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ci_success_via_run_id() {
+        let mut client = MockGitHubClient::new();
+        client.mock(
+            "repos/foo/bar/actions/runs/999",
+            "{status: .status, conclusion: .conclusion}",
+            r#"{"status": "completed", "conclusion": "success"}"#,
+        );
+        let cond = GitHubCondition::CiSuccess { repo: "foo/bar".into(), number: 999 };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["conclusion"], "success");
+    }
+
+    #[tokio::test]
+    async fn test_ci_failure_via_run_id() {
+        let mut client = MockGitHubClient::new();
+        client.mock(
+            "repos/foo/bar/actions/runs/999",
+            "{status: .status, conclusion: .conclusion}",
+            r#"{"status": "completed", "conclusion": "failure"}"#,
+        );
+        let cond = GitHubCondition::CiFailure { repo: "foo/bar".into(), number: 999 };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ci_not_yet_completed() {
+        let mut client = MockGitHubClient::new();
+        client.mock(
+            "repos/foo/bar/actions/runs/999",
+            "{status: .status, conclusion: .conclusion}",
+            r#"{"status": "in_progress", "conclusion": ""}"#,
+        );
+        let cond = GitHubCondition::CiSuccess { repo: "foo/bar".into(), number: 999 };
+        assert!(check(&cond, &client).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ci_pr_based_all_success() {
+        let mut client = MockGitHubClient::new();
+        // actions/runs fails (not a run ID) — triggers PR fallback
+        client.mock("repos/foo/bar/pulls/42", ".head.sha", "abc123");
+        client.mock(
+            "repos/foo/bar/commits/abc123/check-runs?per_page=100&page=1",
+            ".",
+            r#"{"check_runs": [
+                {"name": "build", "status": "completed", "conclusion": "success"},
+                {"name": "test", "status": "completed", "conclusion": "success"}
+            ]}"#,
+        );
+        let cond = GitHubCondition::PrCiPassed { repo: "foo/bar".into(), number: 42 };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["conclusion"], "success");
+    }
+
+    #[tokio::test]
+    async fn test_ci_pr_based_has_failure() {
+        let mut client = MockGitHubClient::new();
+        client.mock("repos/foo/bar/pulls/42", ".head.sha", "abc123");
+        client.mock(
+            "repos/foo/bar/commits/abc123/check-runs?per_page=100&page=1",
+            ".",
+            r#"{"check_runs": [
+                {"name": "build", "status": "completed", "conclusion": "success"},
+                {"name": "test", "status": "completed", "conclusion": "failure"}
+            ]}"#,
+        );
+        // CiSuccess should NOT fire when there's a failure
+        let cond = GitHubCondition::PrCiPassed { repo: "foo/bar".into(), number: 42 };
+        let result = check(&cond, &client).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_api_error_propagates() {
+        let client = MockGitHubClient::new(); // no mocks registered
+        let cond = GitHubCondition::PrMerged { repo: "foo/bar".into(), number: 1 };
+        let result = check(&cond, &client).await;
+        assert!(result.is_err());
     }
 }
