@@ -217,24 +217,36 @@ async fn dispatch_callback(command: &str, event_data: &serde_json::Value) {
 
     let event_json = serde_json::to_string(event_data).unwrap_or_default();
 
-    let result = tokio::process::Command::new("sh")
+    let mut child = match tokio::process::Command::new("sh")
         .args(["-c", command])
         .env("NUDGE_EVENT", &event_json)
         .stdin(std::process::Stdio::null())
-        .output()
-        .await;
-
-    match result {
-        Ok(output) => {
-            if output.status.success() {
-                tracing::info!(command, "Callback succeeded");
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::error!(command, stderr = %stderr, "Callback failed");
-            }
-        }
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
         Err(e) => {
             tracing::error!(command, error = %e, "Failed to spawn callback");
+            return;
+        }
+    };
+
+    let timeout_duration = std::time::Duration::from_secs(300);
+    match tokio::time::timeout(timeout_duration, child.wait()).await {
+        Ok(Ok(status)) => {
+            if status.success() {
+                tracing::info!(command, "Callback succeeded");
+            } else {
+                tracing::error!(command, ?status, "Callback failed");
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::error!(command, error = %e, "Failed to wait on callback");
+        }
+        Err(_) => {
+            tracing::error!(command, "Callback timed out after 300s, killing child process");
+            let _ = child.kill().await;
         }
     }
 }

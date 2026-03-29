@@ -237,9 +237,9 @@ pub fn parse_duration_secs(s: &str) -> Result<i64> {
     }
     match unit {
         "s" => Ok(num),
-        "m" => Ok(num * 60),
-        "h" => Ok(num * 3600),
-        "d" => Ok(num * 86400),
+        "m" => num.checked_mul(60).ok_or_else(|| anyhow::anyhow!("duration overflow: {s}")),
+        "h" => num.checked_mul(3600).ok_or_else(|| anyhow::anyhow!("duration overflow: {s}")),
+        "d" => num.checked_mul(86400).ok_or_else(|| anyhow::anyhow!("duration overflow: {s}")),
         _ => bail!("unknown duration unit: {unit}. Use s/m/h/d"),
     }
 }
@@ -259,6 +259,12 @@ mod tests {
     #[test]
     fn test_parse_duration_negative() {
         assert!(parse_duration_secs("-5m").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_overflow() {
+        assert!(parse_duration_secs("9999999999999999999d").is_err());
+        assert!(parse_duration_secs("9223372036854775807h").is_err());
     }
 
     #[test]
