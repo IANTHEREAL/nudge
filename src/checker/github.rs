@@ -49,7 +49,7 @@ pub async fn check<C: GitHubClient>(condition: &GitHubCondition, client: &C) -> 
             check_new_comment(client, repo, *number, *baseline).await
         }
         GitHubCondition::PrCiPassed { repo, number } => {
-            check_ci(client, repo, *number, "success").await
+            check_pr_ci(client, repo, *number, "success").await
         }
         GitHubCondition::IssueClosed { repo, number } => {
             check_issue_closed(client, repo, *number).await
@@ -194,6 +194,54 @@ async fn fetch_all_check_runs<C: GitHubClient>(client: &C, repo: &str, sha: &str
     }
 
     Ok(all_checks)
+}
+
+/// PR-based CI check: skip actions/runs and go directly to PR head SHA check-runs.
+async fn check_pr_ci<C: GitHubClient>(client: &C, repo: &str, number: i64, expected: &str) -> Result<Option<serde_json::Value>> {
+    let sha = client.api(
+        &format!("repos/{repo}/pulls/{number}"),
+        ".head.sha",
+    ).await?;
+
+    if sha.is_empty() {
+        return Ok(None);
+    }
+
+    let checks = fetch_all_check_runs(client, repo, &sha).await?;
+
+    if checks.is_empty() {
+        return Ok(None);
+    }
+
+    let all_completed = checks.iter().all(|c| c["status"] == "completed");
+    if !all_completed {
+        return Ok(None);
+    }
+
+    let overall = if checks.iter().all(|c| c["conclusion"] == "success") {
+        "success"
+    } else if checks.iter().any(|c| c["conclusion"] == "failure") {
+        "failure"
+    } else {
+        "completed"
+    };
+
+    let fired = match expected {
+        "success" => overall == "success",
+        "failure" => overall == "failure",
+        "completed" => true,
+        _ => false,
+    };
+
+    if fired {
+        Ok(Some(serde_json::json!({
+            "source": "github", "type": "ci_result",
+            "repo": repo, "pr": number, "conclusion": overall,
+            "checks": checks,
+        })))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn check_ci<C: GitHubClient>(client: &C, repo: &str, number: i64, expected: &str) -> Result<Option<serde_json::Value>> {
