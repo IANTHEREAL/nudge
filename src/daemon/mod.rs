@@ -241,20 +241,30 @@ async fn dispatch_callback(command: &str, event_data: &serde_json::Value) {
         let (status, stdout_bytes, stderr_bytes) = tokio::join!(
             child.wait(),
             async {
+                const MAX_OUTPUT: u64 = 1_048_576; // 1 MB
                 match stdout {
-                    Some(mut r) => {
+                    Some(r) => {
                         let mut buf = Vec::new();
-                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf).await;
+                        let _ = tokio::io::AsyncReadExt::read_to_end(
+                            &mut tokio::io::AsyncReadExt::take(r, MAX_OUTPUT),
+                            &mut buf,
+                        )
+                        .await;
                         buf
                     }
                     None => Vec::new(),
                 }
             },
             async {
+                const MAX_OUTPUT: u64 = 1_048_576; // 1 MB
                 match stderr {
-                    Some(mut r) => {
+                    Some(r) => {
                         let mut buf = Vec::new();
-                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf).await;
+                        let _ = tokio::io::AsyncReadExt::read_to_end(
+                            &mut tokio::io::AsyncReadExt::take(r, MAX_OUTPUT),
+                            &mut buf,
+                        )
+                        .await;
                         buf
                     }
                     None => Vec::new(),
