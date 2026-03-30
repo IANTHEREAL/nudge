@@ -133,11 +133,11 @@ pub async fn run(_args: DaemonArgs) -> Result<()> {
 
     let client = GhCliClient;
     let mut last_check: HashMap<String, Instant> = HashMap::new();
-
     loop {
         if let Err(e) = poll_cycle(&mut last_check, &client).await {
             tracing::error!(error = %e, "Poll cycle error");
         }
+
         sleep(Duration::from_secs(TICK_INTERVAL_SECS)).await;
     }
 }

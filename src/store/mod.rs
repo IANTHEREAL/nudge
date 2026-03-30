@@ -323,6 +323,43 @@ mod tests {
     }
 
     #[test]
+    fn test_store_insert_get_roundtrip_full_uuid() {
+        // T2: Insert with full UUID, retrieve, verify round-trip
+        let store = Store::open(":memory:").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let sub = Subscription {
+            id: id.clone(),
+            source: "timer".into(),
+            condition: Condition::Timer { duration: "10m".into(), fire_at: 99999999999 },
+            mode: "wait".into(),
+            callback: None,
+            status: "active".into(),
+            created_at: 1000,
+            expires_at: None,
+            event_data: None,
+        };
+        store.insert(&sub).unwrap();
+        let got = store.get(&id).unwrap().unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.source, "timer");
+        assert_eq!(got.status, "active");
+        assert_eq!(got.mode, "wait");
+        // Verify the ID is a full UUID (36 chars with hyphens)
+        assert_eq!(id.len(), 36);
+    }
+
+    #[test]
+    fn test_store_insert_duplicate_id_rejected() {
+        // T3: Two subscriptions with identical IDs should fail on second insert
+        let store = Store::open(":memory:").unwrap();
+        let sub1 = timer_sub("duplicate-id");
+        let sub2 = timer_sub("duplicate-id");
+        store.insert(&sub1).unwrap();
+        let result = store.insert(&sub2);
+        assert!(result.is_err(), "Expected error on duplicate ID insert");
+    }
+
+    #[test]
     fn test_fire_before_expire_ordering() {
         let store = Store::open(":memory:").unwrap();
         let mut sub = timer_sub("test-order");
