@@ -11,8 +11,6 @@ use crate::store::Store;
 const SOCK_NAME: &str = "daemon.sock";
 const TICK_INTERVAL_SECS: u64 = 2;
 const GITHUB_INTERVAL_SECS: u64 = 60;
-const PRUNE_INTERVAL_SECS: u64 = 3600;
-const PRUNE_AGE_SECS: i64 = 7 * 86400; // 7 days
 
 /// Check if the daemon is already running by trying to connect to the Unix socket.
 pub fn is_running() -> bool {
@@ -135,30 +133,9 @@ pub async fn run(_args: DaemonArgs) -> Result<()> {
 
     let client = GhCliClient;
     let mut last_check: HashMap<String, Instant> = HashMap::new();
-    let mut last_prune = Instant::now();
-
-    // Prune old completed subscriptions on startup
-    if let Ok(db) = Store::open_default() {
-        match db.prune_completed(PRUNE_AGE_SECS) {
-            Ok(n) if n > 0 => tracing::info!(count = n, "Pruned old completed subscriptions"),
-            _ => {}
-        }
-    }
-
     loop {
         if let Err(e) = poll_cycle(&mut last_check, &client).await {
             tracing::error!(error = %e, "Poll cycle error");
-        }
-
-        // Periodic pruning
-        if last_prune.elapsed() >= Duration::from_secs(PRUNE_INTERVAL_SECS) {
-            last_prune = Instant::now();
-            if let Ok(db) = Store::open_default() {
-                match db.prune_completed(PRUNE_AGE_SECS) {
-                    Ok(n) if n > 0 => tracing::info!(count = n, "Pruned old completed subscriptions"),
-                    _ => {}
-                }
-            }
         }
 
         sleep(Duration::from_secs(TICK_INTERVAL_SECS)).await;
