@@ -153,6 +153,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// Delete fired/expired/cancelled subscriptions older than `older_than_secs` seconds.
+    /// Returns the number of rows deleted.
+    pub fn prune_completed(&self, older_than_secs: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - older_than_secs;
+        let rows = self.conn.execute(
+            "DELETE FROM subscriptions
+             WHERE status IN ('fired', 'expired', 'cancelled')
+               AND created_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(rows)
+    }
+
     pub fn status_counts(&self) -> Result<StatusCounts> {
         let mut stmt = self.conn.prepare(
             "SELECT status, COUNT(*) FROM subscriptions GROUP BY status",
@@ -320,6 +333,95 @@ mod tests {
         // After expiration, set_fired should return false
         let fired = store.set_fired("test-fire-active", &serde_json::json!({})).unwrap();
         assert!(!fired);
+    }
+
+    #[test]
+    fn test_store_insert_get_roundtrip_full_uuid() {
+        // T2: Insert with full UUID, retrieve, verify round-trip
+        let store = Store::open(":memory:").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let sub = Subscription {
+            id: id.clone(),
+            source: "timer".into(),
+            condition: Condition::Timer { duration: "10m".into(), fire_at: 99999999999 },
+            mode: "wait".into(),
+            callback: None,
+            status: "active".into(),
+            created_at: 1000,
+            expires_at: None,
+            event_data: None,
+        };
+        store.insert(&sub).unwrap();
+        let got = store.get(&id).unwrap().unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.source, "timer");
+        assert_eq!(got.status, "active");
+        assert_eq!(got.mode, "wait");
+        // Verify the ID is a full UUID (36 chars with hyphens)
+        assert_eq!(id.len(), 36);
+    }
+
+    #[test]
+    fn test_store_insert_duplicate_id_rejected() {
+        // T3: Two subscriptions with identical IDs should fail on second insert
+        let store = Store::open(":memory:").unwrap();
+        let sub1 = timer_sub("duplicate-id");
+        let sub2 = timer_sub("duplicate-id");
+        store.insert(&sub1).unwrap();
+        let result = store.insert(&sub2);
+        assert!(result.is_err(), "Expected error on duplicate ID insert");
+        assert!(
+            result.unwrap_err().to_string().contains("UNIQUE constraint failed"),
+            "Expected UNIQUE constraint error"
+        );
+    }
+
+    #[test]
+    fn test_prune_completed() {
+        // T4: Prune old fired/expired/cancelled subs, keep active ones
+        let store = Store::open(":memory:").unwrap();
+
+        // Insert an active sub with old timestamp
+        let mut active_sub = timer_sub("active-old");
+        active_sub.created_at = 1000;
+        store.insert(&active_sub).unwrap();
+
+        // Insert fired sub with old timestamp
+        let mut fired_sub = timer_sub("fired-old");
+        fired_sub.status = "fired".into();
+        fired_sub.created_at = 1000;
+        store.insert(&fired_sub).unwrap();
+
+        // Insert expired sub with old timestamp
+        let mut expired_sub = timer_sub("expired-old");
+        expired_sub.status = "expired".into();
+        expired_sub.created_at = 1000;
+        store.insert(&expired_sub).unwrap();
+
+        // Insert cancelled sub with old timestamp
+        let mut cancelled_sub = timer_sub("cancelled-old");
+        cancelled_sub.status = "cancelled".into();
+        cancelled_sub.created_at = 1000;
+        store.insert(&cancelled_sub).unwrap();
+
+        // Insert a recent fired sub (should NOT be pruned)
+        let mut recent_fired = timer_sub("fired-recent");
+        recent_fired.status = "fired".into();
+        recent_fired.created_at = chrono::Utc::now().timestamp();
+        store.insert(&recent_fired).unwrap();
+
+        // Prune subs older than 1 day
+        let pruned = store.prune_completed(86400).unwrap();
+        assert_eq!(pruned, 3, "Should prune 3 old completed subs");
+
+        // Active sub should still exist
+        assert!(store.get("active-old").unwrap().is_some());
+        // Recent fired sub should still exist
+        assert!(store.get("fired-recent").unwrap().is_some());
+        // Old completed subs should be gone
+        assert!(store.get("fired-old").unwrap().is_none());
+        assert!(store.get("expired-old").unwrap().is_none());
+        assert!(store.get("cancelled-old").unwrap().is_none());
     }
 
     #[test]

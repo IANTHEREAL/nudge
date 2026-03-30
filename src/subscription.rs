@@ -63,7 +63,7 @@ impl Subscription {
             .map(|d| Utc::now().timestamp() + d);
 
         Ok(Self {
-            id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
             source: condition.source_name().to_string(),
             condition,
             mode: "wait".into(),
@@ -81,7 +81,7 @@ impl Subscription {
             .map(|d| Utc::now().timestamp() + d);
 
         Ok(Self {
-            id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
             source: condition.source_name().to_string(),
             condition,
             mode: "on".into(),
@@ -348,6 +348,18 @@ mod tests {
             let json2 = serde_json::to_string(&parsed).unwrap();
             assert_eq!(json, json2, "roundtrip failed for: {json}");
         }
+    }
+
+    #[test]
+    fn test_subscription_id_uniqueness() {
+        use std::collections::HashSet;
+        // T1: Generate 10,000 subscriptions and verify all IDs are unique
+        let mut ids = HashSet::new();
+        for _ in 0..10_000 {
+            let id = uuid::Uuid::new_v4().to_string();
+            assert!(ids.insert(id), "Duplicate subscription ID generated");
+        }
+        assert_eq!(ids.len(), 10_000);
     }
 
     #[test]
