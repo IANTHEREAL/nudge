@@ -217,24 +217,84 @@ async fn dispatch_callback(command: &str, event_data: &serde_json::Value) {
 
     let event_json = serde_json::to_string(event_data).unwrap_or_default();
 
-    let result = tokio::process::Command::new("sh")
+    let mut child = match tokio::process::Command::new("sh")
         .args(["-c", command])
         .env("NUDGE_EVENT", &event_json)
         .stdin(std::process::Stdio::null())
-        .output()
-        .await;
-
-    match result {
-        Ok(output) => {
-            if output.status.success() {
-                tracing::info!(command, "Callback succeeded");
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::error!(command, stderr = %stderr, "Callback failed");
-            }
-        }
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
         Err(e) => {
             tracing::error!(command, error = %e, "Failed to spawn callback");
+            return;
+        }
+    };
+
+    // Take stdout/stderr so we can drain them concurrently with wait(),
+    // preventing pipe-buffer deadlock when the child writes >64KB.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let drain = async {
+        let (status, stdout_bytes, stderr_bytes) = tokio::join!(
+            child.wait(),
+            async {
+                const MAX_OUTPUT: u64 = 1_048_576; // 1 MB
+                match stdout {
+                    Some(r) => {
+                        let mut buf = Vec::new();
+                        let _ = tokio::io::AsyncReadExt::read_to_end(
+                            &mut tokio::io::AsyncReadExt::take(r, MAX_OUTPUT),
+                            &mut buf,
+                        )
+                        .await;
+                        buf
+                    }
+                    None => Vec::new(),
+                }
+            },
+            async {
+                const MAX_OUTPUT: u64 = 1_048_576; // 1 MB
+                match stderr {
+                    Some(r) => {
+                        let mut buf = Vec::new();
+                        let _ = tokio::io::AsyncReadExt::read_to_end(
+                            &mut tokio::io::AsyncReadExt::take(r, MAX_OUTPUT),
+                            &mut buf,
+                        )
+                        .await;
+                        buf
+                    }
+                    None => Vec::new(),
+                }
+            },
+        );
+        (status, stdout_bytes, stderr_bytes)
+    };
+
+    let timeout_duration = std::time::Duration::from_secs(300);
+    match tokio::time::timeout(timeout_duration, drain).await {
+        Ok((Ok(status), _stdout_bytes, stderr_bytes)) => {
+            if status.success() {
+                let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+                if !stderr_str.is_empty() {
+                    tracing::warn!(command, stderr = %stderr_str, "Callback succeeded with stderr output");
+                } else {
+                    tracing::info!(command, "Callback succeeded");
+                }
+            } else {
+                let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+                tracing::error!(command, ?status, stderr = %stderr_str, "Callback failed");
+            }
+        }
+        Ok((Err(e), _, _)) => {
+            tracing::error!(command, error = %e, "Failed to wait on callback");
+        }
+        Err(_) => {
+            tracing::error!(command, "Callback timed out after 300s, killing child process");
+            let _ = child.kill().await;
         }
     }
 }

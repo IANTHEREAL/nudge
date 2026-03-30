@@ -77,7 +77,8 @@ impl Store {
             Ok(row_to_sub(row))
         })?;
         match rows.next() {
-            Some(Ok(sub)) => Ok(Some(sub)),
+            Some(Ok(Some(sub))) => Ok(Some(sub)),
+            Some(Ok(None)) => Ok(None),
             Some(Err(e)) => Err(e.into()),
             None => Ok(None),
         }
@@ -107,7 +108,9 @@ impl Store {
 
         let mut subs = vec![];
         for row in rows {
-            subs.push(row?);
+            if let Some(sub) = row? {
+                subs.push(sub);
+            }
         }
         Ok(subs)
     }
@@ -172,22 +175,30 @@ impl Store {
     }
 }
 
-fn row_to_sub(row: &rusqlite::Row) -> Subscription {
+fn row_to_sub(row: &rusqlite::Row) -> Option<Subscription> {
     let condition_str: String = row.get(2).unwrap_or_default();
     let event_str: Option<String> = row.get(8).unwrap_or(None);
 
-    Subscription {
+    let condition = match serde_json::from_str(&condition_str) {
+        Ok(c) => c,
+        Err(e) => {
+            let id: String = row.get(0).unwrap_or_default();
+            tracing::warn!(id, condition = %condition_str, error = %e, "Skipping row with invalid condition JSON");
+            return None;
+        }
+    };
+
+    Some(Subscription {
         id: row.get(0).unwrap_or_default(),
         source: row.get(1).unwrap_or_default(),
-        condition: serde_json::from_str(&condition_str)
-            .expect("invalid condition JSON in database; delete ~/.nudge/subscriptions.db to reset"),
+        condition,
         mode: row.get(3).unwrap_or_default(),
         callback: row.get(4).unwrap_or(None),
         status: row.get(5).unwrap_or_default(),
         created_at: row.get(6).unwrap_or(0),
         expires_at: row.get(7).unwrap_or(None),
         event_data: event_str.and_then(|s| serde_json::from_str(&s).ok()),
-    }
+    })
 }
 
 fn dirs_next() -> std::path::PathBuf {
